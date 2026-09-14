@@ -26,6 +26,11 @@
 
 // dedup helpers
 
+static bool use_compact_attn_mask(const llama_cparams & cparams, const llama_ubatch & ubatch, int64_t n_kv) {
+    return cparams.compact_attn_mask && cparams.flash_attn && ubatch.n_seqs_unq <= 32 &&
+        (cparams.compact_attn_mask == 2 || 4*sizeof(int32_t)*(n_kv + ubatch.n_tokens) < sizeof(ggml_fp16_t)*n_kv*ubatch.n_tokens);
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -34,6 +39,13 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    if (use_compact_attn_mask(cparams, ubatch, n_kv)) {
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_kv + n_tokens);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_mask_compact");
+        return res;
+    }
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -55,6 +67,15 @@ static bool can_reuse_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
+
+    if (kq_mask->type == GGML_TYPE_I32) {
+        return use_compact_attn_mask(cparams, ubatch, n_kv) &&
+            kq_mask->ne[0] == 4 && kq_mask->ne[1] == n_kv + n_tokens &&
+            kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+    }
+    if (use_compact_attn_mask(cparams, ubatch, n_kv)) {
+        return false;
+    }
 
     res &= (kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
