@@ -1730,9 +1730,41 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    const uint32_t n_tokens = ubatch->n_tokens;
-
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && ubatch->n_seqs_unq <= 32);
+        GGML_ASSERT(dst->ne[0] == 4 && dst->ne[2] == 1 && dst->ne[3] == 1);
+        const uint32_t n_kv = dst->ne[1] - ubatch->n_tokens;
+        const bool is_2d = ubatch->is_pos_2d();
+        const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+        int32_t * data = (int32_t *) dst->data;
+
+        // Records contain position, sequence bits, and the two M-RoPE coordinates. Q records follow K.
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            uint32_t bits = 0;
+            if (!cells.is_empty(j)) {
+                for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+                    if (cells.seq_has(j, ubatch->seq_id_unq[s])) {
+                        bits |= uint32_t(1) << s;
+                    }
+                }
+            }
+            data[4*j + 0] = bits ? cells.pos_get(j) : -1;
+            memcpy(data + 4*j + 1, &bits, sizeof(bits));
+            data[4*j + 2] = is_2d && bits ? cells.ext_get(j).x : 0;
+            data[4*j + 3] = is_2d && bits ? cells.ext_get(j).y : 0;
+        }
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const uint32_t bits = uint32_t(1) << ubatch->seq_idx[ubatch->seq_id[i][0]];
+            data[4*(n_kv + i) + 0] = ubatch->pos[i];
+            memcpy(data + 4*(n_kv + i) + 1, &bits, sizeof(bits));
+            data[4*(n_kv + i) + 2] = is_2d ? ubatch->pos[i + 2*ubatch->n_tokens] : 0;
+            data[4*(n_kv + i) + 3] = is_2d ? ubatch->pos[i +   ubatch->n_tokens] : 0;
+        }
+        return;
+    }
+    const uint32_t n_tokens = ubatch->n_tokens;
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch

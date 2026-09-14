@@ -1035,6 +1035,9 @@ class tensor_traits_common : public tensor_traits_base {
                         return true;
                 }
             case GGML_OP_FLASH_ATTN_EXT:
+                if (op->src[3] && op->src[3]->type == GGML_TYPE_I32) {
+                    return false;
+                }
                 forward_flash_attn_ext_f16(params, op);
                 return true;
             case GGML_OP_CONT:
