@@ -605,9 +605,29 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
-        const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
+        const int stride_mask, const int n_kv, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    if (stride_mask == 0) {
+        const int4 * meta = (const int4 *) mask_h;
+#pragma unroll
+        for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+            const int j = j1 + threadIdx.y;
+            if (j >= ncols1) {
+                break;
+            }
+            const int4 q = meta[n_kv + fastmodulo(j0 + j, ne01)];
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                if (i < nbatch_fa) {
+                    const int k = k_VKQ_0 + i;
+                    tile_mask[j*(nbatch_fa + 8) + i] = half(k < n_kv && flash_attn_compact_mask_keep(meta[k], q) ? 0.0f : -INFINITY);
+                }
+            }
+        }
+        return;
+    }
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
         static_assert(!oob_check, "OOB check incompatible with cp_async");
@@ -774,7 +794,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+                (mask_h, tile_mask, stride_mask, ne11, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
         }
     }
 
@@ -1128,7 +1148,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, ne11, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
@@ -1142,7 +1162,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if constexpr (ncols2 > 1 && !use_sparse) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, ne11, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
             }
             flash_attn_ext_quant_prefetch_tile<type_KV, DKQ, nwarps, nbatch_fa>
                 ((const char *) K_h2, tile_K_quant, stride_K, k_VKQ_0 + nbatch_fa, ne11 - k_VKQ_0 - nbatch_fa);
@@ -1474,7 +1494,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (kv_prefetch) {
         if constexpr (ncols2 > 1 && !use_sparse) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                (mask_h, tile_mask, stride_mask, ne11, kb0*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
         }
         flash_attn_ext_quant_prefetch_tile<type_KV, DKQ, nwarps, nbatch_fa>
             ((const char *) K_h2, tile_K_quant, stride_K, kb0*nbatch_fa, ne11 - kb0*nbatch_fa);
@@ -1489,7 +1509,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int  k_VKQ_sup    = nbatch_fa;
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                (mask_h, tile_mask, stride_mask, ne11, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
             (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
@@ -2033,7 +2053,7 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = kv_quant ? nb11 : nb11 / sizeof(half2);
-    const int stride_mask = nb31 / sizeof(half);
+    const int stride_mask = ne32 == 0 ? 0 : nb31 / sizeof(half);
 
     const int stride_V = V_is_K_view ? stride_K : kv_quant ? nb21 : nb21 / sizeof(half2);
 

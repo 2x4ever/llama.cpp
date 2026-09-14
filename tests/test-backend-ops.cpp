@@ -7656,9 +7656,10 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool compact_mask;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) + ",compact_mask=" + std::to_string(compact_mask);
     }
 
     double max_nmse_err() override {
@@ -7675,9 +7676,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool compact_mask = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), compact_mask(compact_mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7725,7 +7726,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = compact_mask ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 4, kv + nb, 1, nr23[1]) : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -7750,7 +7751,27 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                if (n_kv_max > 0) {
+                if (compact_mask) {
+                    std::vector<int32_t> data(ggml_nelements(t));
+                    for (int64_t seq = 0; seq < nr23[1]; ++seq) {
+                        int32_t * dst = data.data() + 4*(kv + nb)*seq;
+                        for (int64_t j = 0; j < kv; ++j) {
+                            const uint32_t bits = j == 0 ? 0x80000003u : j%11 == 0 ? 0 : j%3 == 2 ? 0x80000000u : 1u << (j%3);
+                            dst[4*j] = j == 0 ? -1 : (j*37 + seq*3)%kv;
+                            memcpy(dst + 4*j + 1, &bits, sizeof(bits));
+                            dst[4*j + 2] = j%3;
+                            dst[4*j + 3] = j%5;
+                        }
+                        for (int64_t i = 0; i < nb; ++i) {
+                            const uint32_t bits = i%3 == 2 ? 0x80000000u : 1u << (i%3);
+                            dst[4*(kv + i)] = (i*23 + 31)%kv;
+                            memcpy(dst + 4*(kv + i) + 1, &bits, sizeof(bits));
+                            dst[4*(kv + i) + 2] = i%4;
+                            dst[4*(kv + i) + 3] = i%6;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                } else if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
@@ -10652,6 +10673,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // Compact causal masks: holes, shared prefixes, mixed sequences and M-RoPE ties.
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t nq : {1, 2, 7, 65, 1024}) {
+            for (int64_t nk : {512, 1025}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, nk, nq, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, 0, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {1, 2}, 512, 65, true, true, 0, 10, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 0, true));
     }
 
     // mixed quant and Q1_0 test cases

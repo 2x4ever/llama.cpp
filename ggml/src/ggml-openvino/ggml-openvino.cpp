@@ -1171,6 +1171,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_FLASH_ATTN_EXT: {
+        if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+            return {false, "FLASH_ATTN_EXT requires an F16 mask"};
+        }
         float scale = 1.0f;
         float max_bias = 0.0f;
         float logit_softcap = 0.0f;
