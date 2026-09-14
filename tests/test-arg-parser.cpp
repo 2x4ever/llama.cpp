@@ -274,6 +274,17 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    {
+        common_params server_params;
+        argv = {"binary_name", "--prefill-decode-ratio", "10"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+        assert(server_params.prefill_decode_ratio == 10);
+
+        common_params invalid_server_params;
+        argv = {"binary_name", "--prefill-decode-ratio", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_server_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
