@@ -118,6 +118,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    if (mask && mask->type != GGML_TYPE_F16) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
