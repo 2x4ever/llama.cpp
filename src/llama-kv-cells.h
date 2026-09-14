@@ -263,6 +263,24 @@ public:
         return false;
     }
 
+    // remove sequence cells in [p0, p1), return the first freed cell or size()
+    uint32_t seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        auto & positions = seq_pos[seq_id];
+        auto it = positions.lower_bound({ p0, 0 });
+        uint32_t first = size();
+
+        while (it != positions.end() && it->first < p1) {
+            const uint32_t i = (it++)->second;
+            if (seq_rm(i, seq_id) && i < first) {
+                first = i;
+            }
+        }
+
+        return first;
+    }
+
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
