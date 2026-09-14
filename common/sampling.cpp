@@ -17,12 +17,16 @@
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 static void set_logits_from_f32(llama_token_data * data, const float * logits, int32_t n_vocab) {
     int32_t i = 0;
-#if defined(__SSE2__)
+#if defined(__SSE2__) || defined(__ARM_NEON)
     static_assert(sizeof(llama_token_data) == 12 && offsetof(llama_token_data, id) == 0 && offsetof(llama_token_data, logit) == 4 && offsetof(llama_token_data, p) == 8);
+#endif
+#if defined(__SSE2__)
     __m128i ids = _mm_setr_epi32(0, 1, 2, 3);
     const __m128 zero = _mm_setzero_ps();
     const int32_t n_vec = n_vocab - n_vocab%4;
@@ -44,6 +48,18 @@ static void set_logits_from_f32(llama_token_data * data, const float * logits, i
         std::memcpy(dst + 16, &out1, 16);
         std::memcpy(dst + 32, &out2, 16);
         ids = _mm_add_epi32(ids, _mm_set1_epi32(4));
+    }
+#elif defined(__ARM_NEON)
+    uint32x4_t ids = { 0, 1, 2, 3 };
+    const uint32x4_t zero = vdupq_n_u32(0);
+    const int32_t n_vec = n_vocab - n_vocab%16;
+
+    for (; i < n_vec; i += 16) {
+        for (int32_t j = 0; j < 16; j += 4) {
+            const uint32x4x3_t entries = { { ids, vreinterpretq_u32_f32(vld1q_f32(logits + i + j)), zero } };
+            vst3q_u32(reinterpret_cast<uint32_t *>(data + i + j), entries);
+            ids = vaddq_u32(ids, vdupq_n_u32(4));
+        }
     }
 #endif
     for (; i < n_vocab; ++i) {
