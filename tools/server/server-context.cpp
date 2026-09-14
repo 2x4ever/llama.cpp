@@ -911,6 +911,7 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+    int32_t n_decode_only_batches = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3100,6 +3101,8 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
+        const bool has_decode = batch.size() > 0;
+
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
@@ -3108,7 +3111,13 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        const bool can_add_prompt =
+            !has_decode ||
+            params_base.prefill_decode_ratio == 0 ||
+            n_decode_only_batches >= params_base.prefill_decode_ratio;
+        bool has_prompt = false;
+
+        if ((params_base.cont_batching && can_add_prompt) || !has_decode) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
@@ -3506,6 +3515,7 @@ private:
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
+                        has_prompt = has_prompt || n_tokens_out > 0;
 
                         // add the mtmd chunk to cache
                         {
@@ -3580,6 +3590,7 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    has_prompt = has_prompt || n_tokens_cur > 0;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -3639,6 +3650,14 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        if (params_base.prefill_decode_ratio > 0) {
+            if (has_prompt) {
+                n_decode_only_batches = 0;
+            } else if (has_decode && n_decode_only_batches < params_base.prefill_decode_ratio) {
+                n_decode_only_batches++;
+            }
         }
     }
 
