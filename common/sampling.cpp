@@ -15,6 +15,42 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+static void set_logits_from_f32(llama_token_data * data, const float * logits, int32_t n_vocab) {
+    int32_t i = 0;
+#if defined(__SSE2__)
+    static_assert(sizeof(llama_token_data) == 12 && offsetof(llama_token_data, id) == 0 && offsetof(llama_token_data, logit) == 4 && offsetof(llama_token_data, p) == 8);
+    __m128i ids = _mm_setr_epi32(0, 1, 2, 3);
+    const __m128 zero = _mm_setzero_ps();
+    const int32_t n_vec = n_vocab - n_vocab%4;
+
+    // Pack four { id, logit, p } entries without changing the float bits.
+    for (; i < n_vec; i += 4) {
+        const __m128 values = _mm_loadu_ps(logits + i);
+        const __m128 lo = _mm_unpacklo_ps(_mm_castsi128_ps(ids), values);
+        const __m128 hi = _mm_unpackhi_ps(_mm_castsi128_ps(ids), values);
+        const __m128 a = _mm_shuffle_ps(lo, zero, _MM_SHUFFLE(0, 0, 2, 2));
+        const __m128 b = _mm_shuffle_ps(lo, zero, _MM_SHUFFLE(0, 0, 3, 3));
+        const __m128 c = _mm_shuffle_ps(zero, hi, _MM_SHUFFLE(2, 2, 0, 0));
+        const __m128 d = _mm_shuffle_ps(hi, zero, _MM_SHUFFLE(0, 0, 3, 3));
+        const __m128 out0 = _mm_shuffle_ps(lo, a, _MM_SHUFFLE(0, 2, 1, 0));
+        const __m128 out1 = _mm_shuffle_ps(b, hi, _MM_SHUFFLE(1, 0, 2, 0));
+        const __m128 out2 = _mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0));
+        auto * dst = reinterpret_cast<char *>(data + i);
+        std::memcpy(dst +  0, &out0, 16);
+        std::memcpy(dst + 16, &out1, 16);
+        std::memcpy(dst + 32, &out2, 16);
+        ids = _mm_add_epi32(ids, _mm_set1_epi32(4));
+    }
+#endif
+    for (; i < n_vocab; ++i) {
+        data[i] = llama_token_data{i, logits[i], 0.0f};
+    }
+}
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -153,9 +189,7 @@ struct common_sampler {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-            }
+            set_logits_from_f32(cur.data(), logits, n_vocab);
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
