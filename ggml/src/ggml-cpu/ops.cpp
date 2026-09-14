@@ -8718,7 +8718,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const ggml_fp16_t * mp = mask && mask->type == GGML_TYPE_F16 ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const int32_t * mc = mask && mask->type == GGML_TYPE_I32 ? (const int32_t *)((const char *) mask->data + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8736,6 +8737,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            if (mc) {
+                const int32_t * mk = mc + 4*ic;
+                const int32_t * mq = mc + 4*(nek1 + iq1);
+                if (!(uint32_t(mk[1]) & uint32_t(mq[1])) || mk[0] > mq[0] ||
+                    (mk[0] == mq[0] && (mk[3] > mq[3] || (mk[3] == mq[3] && mk[2] > mq[2])))) {
+                    continue;
+                }
+            }
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9316,6 +9325,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         bool use_tiled = !use_ref &&
+                               (!dst->src[3] || dst->src[3]->type != GGML_TYPE_I32) &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

@@ -2664,6 +2664,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 // FA not support on 310p device
                 return false;
 #endif
+                if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
                 // derived from [ggml-cuda.cu]
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;

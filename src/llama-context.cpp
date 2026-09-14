@@ -423,6 +423,41 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        const char * compact_mask = getenv("LLAMA_FLASH_ATTN_COMPACT_MASK");
+        if (compact_mask && atoi(compact_mask) != 0) {
+            cparams.compact_attn_mask = model.arch == LLM_ARCH_QWEN35 && model.n_devices() > 0 && cparams.kv_unified &&
+                cparams.causal_attn && cparams.offload_kqv && cparams.flash_attn &&
+                hparams.swa_type == LLAMA_SWA_TYPE_NONE && cparams.n_seq_max <= 32 &&
+                hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
+                (params.type_k == GGML_TYPE_F16 || params.type_k == GGML_TYPE_Q8_0 || params.type_k == GGML_TYPE_Q4_0) && params.type_k == params.type_v &&
+                model.n_gpu_layers() > hparams.n_layer_all && !model.has_tensor_overrides();
+            ggml_context_ptr probe_ctx(ggml_init({ggml_tensor_overhead()*8, nullptr, true}));
+            auto * probe_q = ggml_new_tensor_4d(probe_ctx.get(), GGML_TYPE_F32, 256, 16, 24, 1);
+            auto * probe_k = ggml_new_tensor_4d(probe_ctx.get(), params.type_k, 256, 512, 4, 1);
+            auto * probe_v = ggml_new_tensor_4d(probe_ctx.get(), params.type_v, 256, 512, 4, 1);
+            auto * probe_m = ggml_new_tensor_2d(probe_ctx.get(), GGML_TYPE_I32, 4, 528);
+            auto * probe_op = ggml_flash_attn_ext(probe_ctx.get(), probe_q, probe_k, probe_v, probe_m, 1.0f/16, 0, 0);
+            const bool mtp_mask = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+            const uint32_t il_first = mtp_mask ? hparams.n_layer() : 0;
+            const uint32_t il_end   = mtp_mask ? hparams.n_layer_all : hparams.n_layer();
+            // Check the attention layers in this context, not unused model devices.
+            for (uint32_t il = il_first; cparams.compact_attn_mask && il < il_end; ++il) {
+                if (hparams.is_recr(il) || !hparams.has_kv(il)) {
+                    continue;
+                }
+                auto * dev = model.dev_layer(il);
+                if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 ||
+                    !ggml_backend_dev_supports_op(dev, probe_op)) {
+                    cparams.compact_attn_mask = false;
+                    LLAMA_LOG_INFO("%s: compact attention mask unsupported on %s at layer %u\n", __func__, ggml_backend_dev_name(dev), il);
+                }
+            }
+            if (cparams.compact_attn_mask) {
+                cparams.compact_attn_mask = atoi(compact_mask) == 2 ? 2 : 1;
+            }
+            LLAMA_LOG_INFO("%s: compact attention mask = %s (experimental; context=%s, KV=%s/%s)\n", __func__, cparams.compact_attn_mask == 2 ? "enabled for all batches" : cparams.compact_attn_mask ? "enabled when smaller than dense" : "disabled: unsupported configuration", cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP" : "main", ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
