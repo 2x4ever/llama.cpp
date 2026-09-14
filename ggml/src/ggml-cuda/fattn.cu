@@ -708,7 +708,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = need_f16_V = !ggml_cuda_flash_attn_ext_mma_f16_use_q8(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = need_f16_V = !ggml_cuda_flash_attn_ext_mma_f16_use_native_quant(ggml_cuda_info().devices[device].cc, dst);
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
