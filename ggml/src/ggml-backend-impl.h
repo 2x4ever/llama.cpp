@@ -10,6 +10,33 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 2
 
+    typedef struct ggml_backend_pipeline * ggml_backend_pipeline_t;
+
+    // Register allocated graphs in execution order. Each scheduler may run on its own thread.
+    // Complete or cancel every plan, then drain before freeing buffers. Backends must outlive the pipeline.
+    GGML_API ggml_backend_pipeline_t ggml_backend_pipeline_new(void);
+    GGML_API void ggml_backend_pipeline_free(ggml_backend_pipeline_t pipeline);
+    GGML_API void ggml_backend_pipeline_reset(ggml_backend_pipeline_t pipeline);
+    GGML_API void ggml_backend_sched_prepare_pipeline(ggml_backend_sched_t sched, ggml_backend_pipeline_t pipeline);
+    GGML_API void ggml_backend_sched_cancel_pipeline(ggml_backend_sched_t sched);
+
+    struct ggml_gallocr;
+    struct ggml_gallocr_buffer_provider {
+        void * context;
+        ggml_backend_buffer_t (*alloc)(void * context, ggml_backend_buffer_type_t buft, int buffer_id, int chunk, size_t size);
+        void (*release)(void * context, ggml_backend_buffer_t buffer);
+    };
+    GGML_API struct ggml_gallocr * ggml_gallocr_new_n_with_provider(ggml_backend_buffer_type_t * bufts, int n_buffers, struct ggml_gallocr_buffer_provider provider);
+
+    struct ggml_backend_workspace_pool;
+    GGML_API struct ggml_backend_workspace_pool * ggml_backend_workspace_pool_new(void);
+    GGML_API void ggml_backend_workspace_pool_free(struct ggml_backend_workspace_pool * pool);
+    GGML_API void ggml_backend_workspace_pool_print(struct ggml_backend_workspace_pool * pool);
+    GGML_API size_t ggml_backend_workspace_pool_get_buffer_size(struct ggml_backend_workspace_pool * pool, ggml_backend_buffer_type_t buft);
+    // Attach before graph allocation. Shared scratch needs pipeline fences or external serialization.
+    GGML_API void ggml_backend_sched_set_workspace_pool(ggml_backend_sched_t sched, struct ggml_backend_workspace_pool * pool);
+    GGML_API size_t ggml_backend_sched_get_private_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+
     //
     // Backend buffer type
     //
