@@ -1307,7 +1307,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
-    if (mem->n_rs_seq == 0) {
+    if (mem->n_rs_seq == 0 || (!ubatches.empty() && uint32_t(i) >= ubatches[i_next].n_seqs)) {
         return src0;
     }
 

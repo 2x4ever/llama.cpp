@@ -5,11 +5,13 @@
 
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <vector>
@@ -262,6 +264,101 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+static bool test_inactive_relocation(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max  = 4;
+    cparams.n_rs_seq   = 3;
+    cparams.n_ctx      = 512;
+    cparams.n_batch    = 128;
+    cparams.n_ubatch   = 32;
+    cparams.kv_unified = true;
+    llama_context_ptr ctx(init_ctx(model, cparams, fill));
+    if (!ctx) {
+        return false;
+    }
+
+    auto * memory = llama_get_memory(ctx.get());
+    auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory);
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+        recurrent = hybrid->get_mem_recr();
+    }
+    if (!recurrent || recurrent->n_rs_seq < 3) {
+        fprintf(stderr, "%s : skipping unsupported memory type\n", __func__);
+        return true;
+    }
+
+    const auto token = [&](llama_seq_id seq, llama_pos pos) { return (7*pos + 31*seq + 1) % n_vocab; };
+    const auto decode = [&](llama_context * target, const std::vector<llama_seq_id> & seqs, llama_pos begin, llama_pos end) {
+        llama_batch batch = llama_batch_init(seqs.size()*(end - begin), 0, 1);
+        for (auto seq : seqs) {
+            for (llama_pos pos = begin; pos < end; ++pos) {
+                common_batch_add(batch, token(seq, pos), pos, { seq }, true);
+            }
+        }
+        const bool ok = llama_decode(target, batch) == 0;
+        llama_synchronize(target);
+        llama_batch_free(batch);
+        return ok;
+    };
+    const auto history = [&]() {
+        std::vector<uint8_t> bytes;
+        const int32_t cell = recurrent->cells[1].tail;
+        // Check all history groups of the first layer of each recurrent tensor type.
+        for (const auto * layers : { &recurrent->r_l, &recurrent->s_l, &recurrent->p_l }) {
+            for (auto * tensor : *layers) {
+                if (!tensor || ggml_nbytes(tensor) == 0) { continue; }
+                for (uint32_t group = 0; group <= recurrent->n_rs_seq; ++group) {
+                    const size_t offset = bytes.size();
+                    bytes.resize(offset + tensor->nb[1]);
+                    ggml_backend_tensor_get(tensor, bytes.data() + offset, (group*recurrent->size + cell)*tensor->nb[1], tensor->nb[1]);
+                }
+                break;
+            }
+        }
+        return bytes;
+    };
+
+    bool ok = true;
+    for (bool pending : { false, true }) {
+        llama_memory_clear(memory, false);
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            if (!decode(ctx.get(), { seq }, 0, 20)) { return false; }
+        }
+        if (pending) {
+            if (!llama_memory_seq_rm(memory, 1, 17, -1)) { return false; }
+        }
+        common_prompt_checkpoint state_before;
+        state_before.update_tgt(ctx.get(), 1, 0);
+        const auto before = history();
+        const auto previous_cell = recurrent->cells[1].tail;
+        const auto previous_idx = recurrent->rs_idx[1];
+        if (!decode(ctx.get(), { 0, 2 }, 20, 21)) { return false; }
+        const bool moved = previous_cell != recurrent->cells[1].tail;
+        const bool same_history = !before.empty() && before == history();
+        const bool same_idx = previous_idx == recurrent->rs_idx[1];
+        common_prompt_checkpoint state_after;
+        state_after.update_tgt(ctx.get(), 1, 0);
+        const bool same_state = state_before.data_tgt == state_after.data_tgt;
+        fprintf(stderr, "%s : pending=%d, moved=%d, history=%d, rollback_index=%d, state=%d, bytes=%zu\n",
+                __func__, pending, moved, same_history, same_idx, same_state, before.size());
+        if (!moved || !same_history || !same_idx || !same_state) {
+            ok = false;
+            continue;
+        }
+
+        if (!pending && !llama_memory_seq_rm(memory, 1, 17, -1)) { return false; }
+        if (!decode(ctx.get(), { 1 }, 17, 20) || recurrent->rs_idx[1] != 0) { return false; }
+        for (int row = 0; row < 3; ++row) {
+            const float * logits = llama_get_logits_ith(ctx.get(), row);
+            if (!logits) { return false; }
+            for (int t = 0; t < n_vocab; ++t) {
+                if (!std::isfinite(logits[t])) { return false; }
+            }
+        }
+    }
+    return ok;
+}
+
 static int test_rollback(const common_params & params, llama_model * model, uint8_t fill) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
@@ -432,6 +529,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    const bool relocation = argc > 1 && std::strcmp(argv[1], "relocation") == 0;
+    if (relocation) { --argc; ++argv; }
+
     common_params params;
     params.sampling.seed = 1234;
     params.n_predict = 1;
@@ -458,7 +558,9 @@ int main(int argc, char ** argv) {
 
     for (uint8_t fill : { 0, 0x3e }) {
         fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
-        if (test_rollback(params, model, fill) != 0) {
+        if (relocation) {
+            if (!test_inactive_relocation(params, model, llama_vocab_n_tokens(llama_model_get_vocab(model)), fill)) { return 1; }
+        } else if (test_rollback(params, model, fill) != 0) {
             return 1;
         }
     }
