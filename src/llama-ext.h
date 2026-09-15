@@ -16,6 +16,14 @@ LLAMA_API uint32_t llama_pipeline_n_workers(const llama_context * ctx);
 LLAMA_API uint32_t llama_pipeline_n_ubatch(const llama_context * ctx);
 LLAMA_API int32_t llama_pipeline_stream(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, void * data);
 
+// The executor runs on the lane thread. The worker is synchronized after it returns.
+using llama_pipeline_executor = int32_t (*)(void * data, uint32_t lane, llama_context * worker, const llama_batch & batch);
+LLAMA_API int32_t llama_pipeline_stream_with_executor(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, llama_pipeline_executor executor, void * data);
+// Create shared contexts only while all peers are idle.
+LLAMA_API llama_context * llama_context_create_shared(llama_context * ctx, uint32_t n_batch, uint32_t n_ubatch);
+// The caller must own the sequence until this operation completes.
+LLAMA_API bool llama_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
