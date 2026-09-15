@@ -347,7 +347,9 @@ The supported architectures are `qwen35` and `qwen4exp`. For Qwen4Exp, enable na
 
 `-ub` sets the main context's physical batch limit and the default worker limit. `LLAMA_PIPELINE_UBATCH` can override the worker limit, up to `-b`. Each context retains its own graph and output buffers, while the pool reuses device scratch between GPU stages. More workers can increase host memory and private buffer usage. Throughput depends on stage balance, microbatch size, and the number of active requests.
 
-Single-token decode and operations requiring embeddings, NextN extraction, shared sequence entries, token/embedding combinations, decision ordering, backend sampling, LoRA, evaluation/abort callbacks, or noncausal attention use the main context after draining worker work. Speculative decode does not use independent server lanes. Recurrent rollback (`n_rs_seq > 0`) is not supported by the worker path. `LLAMA_PIPELINE_STREAM=0` disables independent server decode lanes while keeping worker prefill enabled. Unset `LLAMA_PIPELINE_WORKERS` to use the ordinary scheduler.
+Single-token decode and operations requiring embeddings, shared sequence entries, token/embedding combinations, decision ordering, target backend sampling, LoRA, evaluation/abort callbacks, or noncausal attention use the main context after draining worker work. `LLAMA_PIPELINE_STREAM=0` disables independent server decode lanes while keeping worker prefill enabled. Unset `LLAMA_PIPELINE_WORKERS` to use the ordinary scheduler.
+
+Single-head `draft-mtp` supports independent server lanes with shared draft weights, KV and scratch. Each lane keeps its own speculative and draft contexts; shared draft memory access is serialized. Greedy and probabilistic drafting preserve each request's sampler, RNG and hidden state across lane transitions. Chained heads, shared target/draft memory, insufficient target rollback depth, and drafts without partial sequence removal use the main context. The worker ubatch must exceed the target rollback depth plus one.
 
 ### Multimodal support
 
