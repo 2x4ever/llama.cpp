@@ -397,6 +397,7 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 
 struct vbuffer {
     ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
+    struct ggml_gallocr_buffer_provider provider;
 };
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
@@ -404,7 +405,11 @@ static void ggml_vbuffer_free(struct vbuffer * buf) {
         return;
     }
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; ++i) {
-        ggml_backend_buffer_free(buf->chunks[i]);
+        if (buf->provider.release) {
+            if (buf->chunks[i]) { buf->provider.release(buf->provider.context, buf->chunks[i]); }
+        } else {
+            ggml_backend_buffer_free(buf->chunks[i]);
+        }
     }
     free(buf);
 }
@@ -421,20 +426,21 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage, int buffer_id, struct ggml_gallocr_buffer_provider provider) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
     }
 
+    buf->provider = provider;
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        buf->chunks[n] = provider.alloc ? provider.alloc(provider.context, buft, buffer_id, n, chunk_size) : ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;
         }
-        ggml_backend_buffer_set_usage(buf->chunks[n], usage);
+        if (!provider.alloc) { ggml_backend_buffer_set_usage(buf->chunks[n], usage); }
     }
     return buf;
 }
@@ -480,6 +486,7 @@ struct node_alloc {
 };
 
 struct ggml_gallocr {
+    struct ggml_gallocr_buffer_provider provider;
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
@@ -495,9 +502,11 @@ struct ggml_gallocr {
     int n_leafs;
 };
 
-ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+static ggml_gallocr_t ggml_gallocr_new_n_impl(ggml_backend_buffer_type_t * bufts, int n_bufs, struct ggml_gallocr_buffer_provider provider) {
+    GGML_ASSERT((provider.alloc == NULL) == (provider.release == NULL));
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
+    galloc->provider = provider;
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
@@ -514,7 +523,7 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
         // check if the same buffer type is used multiple times and reuse the same allocator
         for (int j = 0; j < i; j++) {
-            if (bufts[i] == bufts[j]) {
+            if (!provider.alloc && bufts[i] == bufts[j]) {
                 galloc->buf_tallocs[i] = galloc->buf_tallocs[j];
                 break;
             }
@@ -529,6 +538,14 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     galloc->n_buffers = n_bufs;
 
     return galloc;
+}
+
+ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+    return ggml_gallocr_new_n_impl(bufts, n_bufs, (struct ggml_gallocr_buffer_provider) {0});
+}
+
+ggml_gallocr_t ggml_gallocr_new_n_with_provider(ggml_backend_buffer_type_t * bufts, int n_bufs, struct ggml_gallocr_buffer_provider provider) {
+    return ggml_gallocr_new_n_impl(bufts, n_bufs, provider);
 }
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
@@ -654,6 +671,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+                if (galloc->provider.alloc && p_hn->buffer_id != buffer_id) { continue; }
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
@@ -936,7 +954,7 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE, i, galloc->provider);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;

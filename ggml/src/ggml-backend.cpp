@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -783,9 +789,150 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_pipeline_fence {
+    ggml_backend_t backend;
+    ggml_backend_event_t event;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool ready = false;
+    bool success = false;
+
+    explicit ggml_pipeline_fence(ggml_backend_t backend) : backend(backend), event(ggml_backend_event_new(ggml_backend_get_device(backend))) {}
+    ~ggml_pipeline_fence() { ggml_backend_event_free(event); }
+
+    bool wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return ready; });
+        if (success && event) { ggml_backend_event_synchronize(event); }
+        return success;
+    }
+
+    void publish(bool ok) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!ready) {
+            success = ok;
+            ready = true;
+            cv.notify_all();
+        }
+    }
+};
+
+struct ggml_backend_pipeline {
+    std::mutex mutex;
+    std::unordered_map<ggml_backend_buffer_t, std::shared_ptr<ggml_pipeline_fence>> tails;
+    std::vector<std::shared_ptr<ggml_pipeline_fence>> fences;
+};
+
+struct ggml_pipeline_plan {
+    std::vector<std::vector<std::shared_ptr<ggml_pipeline_fence>>> before;
+    std::vector<std::shared_ptr<ggml_pipeline_fence>> after;
+};
+
+struct ggml_backend_workspace_pool {
+    struct allocation {
+        ggml_backend_buffer_type_t buft;
+        int chunk;
+        ggml_backend_buffer_t buffer;
+        size_t users;
+    };
+    std::atomic<size_t> references{1};
+    std::mutex mutex;
+    std::vector<allocation> allocations;
+};
+
+struct ggml_sched_workspace {
+    ggml_backend_workspace_pool * pool;
+    int n_backends;
+    std::vector<int> nodes;
+    std::vector<int> leafs;
+    std::vector<int> allocated_nodes;
+    std::vector<int> allocated_leafs;
+
+    ggml_sched_workspace(ggml_backend_workspace_pool * pool, int n_backends) : pool(pool), n_backends(n_backends) {
+        ++pool->references;
+    }
+    ~ggml_sched_workspace() { ggml_backend_workspace_pool_free(pool); }
+};
+
+ggml_backend_workspace_pool * ggml_backend_workspace_pool_new() {
+    return new ggml_backend_workspace_pool;
+}
+
+void ggml_backend_workspace_pool_free(ggml_backend_workspace_pool * pool) {
+    if (pool && --pool->references == 0) {
+        GGML_ASSERT(pool->allocations.empty());
+        delete pool;
+    }
+}
+
+void ggml_backend_workspace_pool_print(ggml_backend_workspace_pool * pool) {
+    if (!pool) { return; }
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    std::map<ggml_backend_buffer_type_t, size_t> sizes;
+    for (const auto & entry : pool->allocations) { sizes[entry.buft] += ggml_backend_buffer_get_size(entry.buffer); }
+    for (const auto & entry : sizes) {
+        GGML_LOG_INFO("%s: %s unique shared scratch = %.2f MiB\n", __func__, ggml_backend_buft_name(entry.first), entry.second/1024.0/1024.0);
+    }
+}
+
+size_t ggml_backend_workspace_pool_get_buffer_size(ggml_backend_workspace_pool * pool, ggml_backend_buffer_type_t buft) {
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    size_t size = 0;
+    for (const auto & entry : pool->allocations) {
+        if (entry.buft == buft) { size += ggml_backend_buffer_get_size(entry.buffer); }
+    }
+    return size;
+}
+
+static bool ggml_workspace_can_share(ggml_backend_buffer_type_t buft) {
+    auto * dev = ggml_backend_buft_get_device(buft);
+    if (!dev || ggml_backend_buft_is_host(buft) || buft != ggml_backend_dev_buffer_type(dev)) { return false; }
+    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+    return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "Vulkan") == 0;
+}
+
+static ggml_backend_buffer_t ggml_workspace_alloc(void * context, ggml_backend_buffer_type_t buft, int buffer_id, int chunk, size_t size) {
+    auto & workspace = *static_cast<ggml_sched_workspace *>(context);
+    if (buffer_id < workspace.n_backends || !ggml_workspace_can_share(buft)) {
+        auto * buffer = ggml_backend_buft_alloc_buffer(buft, size);
+        if (buffer) { ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE); }
+        return buffer;
+    }
+    auto & pool = *workspace.pool;
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    for (auto & entry : pool.allocations) {
+        if (entry.buft == buft && entry.chunk == chunk && ggml_backend_buffer_get_size(entry.buffer) >= size) {
+            ++entry.users;
+            return entry.buffer;
+        }
+    }
+    auto * buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!buffer) { return nullptr; }
+    GGML_ASSERT(!buffer->iface.reset);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    pool.allocations.push_back({buft, chunk, buffer, 1});
+    return buffer;
+}
+
+static void ggml_workspace_release(void * context, ggml_backend_buffer_t buffer) {
+    auto & pool = *static_cast<ggml_sched_workspace *>(context)->pool;
+    std::unique_lock<std::mutex> lock(pool.mutex);
+    for (auto it = pool.allocations.begin(); it != pool.allocations.end(); ++it) {
+        if (it->buffer == buffer) {
+            if (--it->users) { return; }
+            pool.allocations.erase(it);
+            break;
+        }
+    }
+    lock.unlock();
+    ggml_backend_buffer_free(buffer);
+}
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    ggml_pipeline_plan * pipeline_plan;
+    ggml_sched_workspace * workspace;
 
     int n_backends;
 
@@ -1063,6 +1210,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static void ggml_backend_sched_workspace_layout(ggml_backend_sched_t sched);
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1586,6 +1735,61 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    if (sched->workspace) { ggml_backend_sched_workspace_layout(sched); }
+}
+
+static void ggml_backend_sched_workspace_layout(ggml_backend_sched_t sched) {
+    auto root = [](ggml_tensor * tensor) {
+        while (tensor && tensor->view_src) { tensor = tensor->view_src; }
+        return tensor;
+    };
+    std::unordered_set<ggml_tensor *> persistent;
+    std::unordered_map<ggml_tensor *, int> first_split;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        auto mark = [&](ggml_tensor * tensor) {
+            if (!tensor) { return; }
+            auto * base = root(tensor);
+            if ((tensor->flags | base->flags) & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) { persistent.insert(base); }
+            auto entry = first_split.emplace(base, i);
+            if (entry.first->second != i) { persistent.insert(base); }
+        };
+        auto & split = sched->splits[i];
+        for (int j = 0; j < split.n_inputs; ++j) { persistent.insert(root(split.inputs[j])); }
+        for (int j = 0; j < split.graph.n_nodes; ++j) {
+            auto * node = split.graph.nodes[j];
+            mark(node);
+            for (auto * src : node->src) { mark(src); }
+        }
+    }
+    for (int i = 0; i < sched->graph.n_leafs; ++i) { persistent.insert(root(sched->graph.leafs[i])); }
+    std::vector<bool> share(sched->n_backends);
+    for (int b = 0; b < sched->n_backends; ++b) { share[b] = ggml_workspace_can_share(sched->bufts[b]); }
+    auto & workspace = *sched->workspace;
+    workspace.nodes.resize(sched->graph.n_nodes);
+    workspace.leafs.resize(sched->graph.n_leafs);
+    for (int i = 0; i < sched->graph.n_nodes; ++i) {
+        const int b = sched->node_backend_ids[i];
+        const bool scratch = share[b] && !persistent.count(root(sched->graph.nodes[i]));
+        workspace.nodes[i] = b + (scratch ? sched->n_backends : 0);
+    }
+    std::copy(sched->leaf_backend_ids, sched->leaf_backend_ids + sched->graph.n_leafs, workspace.leafs.begin());
+}
+
+static const int * ggml_backend_sched_node_buffer_ids(ggml_backend_sched_t sched) {
+    return sched->workspace ? sched->workspace->nodes.data() : sched->node_backend_ids;
+}
+
+static const int * ggml_backend_sched_leaf_buffer_ids(ggml_backend_sched_t sched) {
+    return sched->workspace ? sched->workspace->leafs.data() : sched->leaf_backend_ids;
+}
+
+static bool ggml_backend_sched_reserve_buffers(ggml_backend_sched_t sched) {
+    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, ggml_backend_sched_node_buffer_ids(sched), ggml_backend_sched_leaf_buffer_ids(sched))) { return false; }
+    if (sched->workspace) {
+        sched->workspace->allocated_nodes = sched->workspace->nodes;
+        sched->workspace->allocated_leafs = sched->workspace->leafs;
+    }
+    return true;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1608,6 +1812,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
+    if (sched->workspace) {
+        backend_ids_changed |= sched->workspace->nodes != sched->workspace->allocated_nodes || sched->workspace->leafs != sched->workspace->allocated_leafs;
+    }
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
@@ -1630,7 +1837,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_backend_sched_reserve_buffers(sched)) { return false; }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1640,8 +1847,90 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+ggml_backend_pipeline_t ggml_backend_pipeline_new() {
+    return new ggml_backend_pipeline;
+}
+
+void ggml_backend_pipeline_reset(ggml_backend_pipeline_t pipeline) {
+    std::lock_guard<std::mutex> lock(pipeline->mutex);
+    for (auto & fence : pipeline->fences) { fence->wait(); }
+    pipeline->tails.clear();
+}
+
+void ggml_backend_pipeline_free(ggml_backend_pipeline_t pipeline) {
+    if (!pipeline) { return; }
+    ggml_backend_pipeline_reset(pipeline);
+    delete pipeline;
+}
+
+void ggml_backend_sched_cancel_pipeline(ggml_backend_sched_t sched) {
+    if (!sched || !sched->pipeline_plan) { return; }
+    ggml_backend_sched_synchronize(sched);
+    for (auto & fence : sched->pipeline_plan->after) {
+        if (fence) { fence->publish(false); }
+    }
+    delete sched->pipeline_plan;
+    sched->pipeline_plan = nullptr;
+}
+
+void ggml_backend_sched_prepare_pipeline(ggml_backend_sched_t sched, ggml_backend_pipeline_t pipeline) {
+    GGML_ASSERT(sched->is_alloc && !sched->pipeline_plan);
+    auto plan = std::make_unique<ggml_pipeline_plan>();
+    plan->before.resize(sched->n_splits);
+    plan->after.resize(sched->n_splits);
+    std::unordered_map<ggml_backend_buffer_t, std::pair<int, int>> access;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        auto record = [&](const ggml_tensor * tensor) {
+            if (!tensor) { return; }
+            while (tensor->view_src) { tensor = tensor->view_src; }
+            auto buffer = tensor->buffer;
+            if (!buffer || ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) { return; }
+            auto entry = access.emplace(buffer, std::make_pair(i, i));
+            entry.first->second.second = i;
+        };
+        auto & split = sched->splits[i];
+        for (int j = 0; j < split.n_inputs; ++j) { record(split.inputs[j]); }
+        for (int j = 0; j < split.graph.n_nodes; ++j) {
+            auto * node = split.graph.nodes[j];
+            record(node);
+            for (auto * src : node->src) { record(src); }
+        }
+    }
+    std::lock_guard<std::mutex> lock(pipeline->mutex);
+    for (const auto & entry : access) {
+        const int first = entry.second.first;
+        const int last = entry.second.second;
+        auto previous = pipeline->tails.find(entry.first);
+        if (previous != pipeline->tails.end()) { plan->before[first].push_back(previous->second); }
+        if (!plan->after[last]) {
+            auto * backend = sched->backends[sched->splits[last].backend_id];
+            auto reusable = std::find_if(pipeline->fences.begin(), pipeline->fences.end(), [&](const auto & fence) {
+                return fence.use_count() == 1 && fence->backend == backend;
+            });
+            if (reusable == pipeline->fences.end()) {
+                plan->after[last] = std::make_shared<ggml_pipeline_fence>(backend);
+                pipeline->fences.push_back(plan->after[last]);
+            } else {
+                plan->after[last] = *reusable;
+                plan->after[last]->wait();
+                plan->after[last]->ready = false;
+                plan->after[last]->success = false;
+            }
+        }
+    }
+    auto tails = pipeline->tails;
+    for (const auto & entry : access) { tails[entry.first] = plan->after[entry.second.second]; }
+    pipeline->tails.swap(tails);
+    sched->pipeline_plan = plan.release();
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    struct pipeline_guard {
+        ggml_backend_sched_t sched;
+        ~pipeline_guard() { ggml_backend_sched_cancel_pipeline(sched); }
+    } guard{sched};
+    auto * plan = sched->pipeline_plan;
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1654,6 +1943,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (plan) {
+            for (const auto & fence : plan->before[split_id]) {
+                if (!fence->wait()) { return GGML_STATUS_FAILED; }
+            }
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1836,9 +2131,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (plan && plan->after[split_id]) {
+            auto & fence = plan->after[split_id];
+            if (fence->event) {
+                ggml_backend_event_record(fence->event, split_backend);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            fence->publish(true);
+        }
+
         prev_backend_id = split_backend_id;
     }
 
+    delete sched->pipeline_plan;
+    sched->pipeline_plan = nullptr;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1914,7 +2221,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_set_workspace_pool(ggml_backend_sched_t sched, ggml_backend_workspace_pool * pool) {
+    GGML_ASSERT(sched->is_reset && !sched->is_alloc && !sched->workspace);
+    sched->workspace = new ggml_sched_workspace(pool, sched->n_backends);
+    std::vector<ggml_backend_buffer_type_t> bufts(sched->bufts, sched->bufts + sched->n_backends);
+    bufts.insert(bufts.end(), sched->bufts, sched->bufts + sched->n_backends);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = ggml_gallocr_new_n_with_provider(bufts.data(), bufts.size(), {sched->workspace, ggml_workspace_alloc, ggml_workspace_release});
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    ggml_backend_sched_cancel_pipeline(sched);
     if (sched == NULL) {
         return;
     }
@@ -1924,6 +2241,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     ggml_gallocr_free(sched->galloc);
+    delete sched->workspace;
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
@@ -1966,7 +2284,13 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    if (sched->workspace) {
+        std::vector<size_t> all_sizes(2 * sched->n_backends);
+        ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, ggml_backend_sched_node_buffer_ids(sched), ggml_backend_sched_leaf_buffer_ids(sched), all_sizes.data());
+        for (int b = 0; b < sched->n_backends; ++b) { sizes[b] = all_sizes[b] + all_sizes[b + sched->n_backends]; }
+    } else {
+        ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -1977,7 +2301,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+    if (!ggml_backend_sched_reserve_buffers(sched)) {
         return false;
     }
 
@@ -2074,12 +2398,21 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
     return sched->bufts[backend_index];
 }
 
+size_t ggml_backend_sched_get_private_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    size_t size = ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    if (sched->workspace) { size += ggml_gallocr_get_buffer_size(sched->galloc, backend_index + sched->n_backends); }
+    return size;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
