@@ -12,9 +12,11 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
+struct llama_context_pipeline;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -46,6 +48,13 @@ struct llama_context {
                   llama_context_params params);
 
     ~llama_context();
+
+    // Create and change shared contexts only while all workers are idle.
+    std::unique_ptr<llama_context> create_shared(uint32_t n_batch, uint32_t n_ubatch);
+    void set_pipeline(uint32_t n_workers, uint32_t n_ubatch);
+    uint32_t pipeline_n_workers() const;
+    uint32_t pipeline_n_ubatch() const;
+    int32_t pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data);
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -135,6 +144,12 @@ struct llama_context {
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
     llm_graph_result * process_ubatch(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    llm_graph_result * prepare_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
@@ -277,7 +292,13 @@ private:
     // members
     //
 
+    llama_context(const llama_model & model, llama_context_params params, llama_context * source);
+    int decode_impl(const llama_batch & batch_inp);
+    int decode_pipeline(const llama_batch & batch_inp);
+    friend struct llama_context_pipeline;
+
     const llama_model & model;
+    const llama_context_params params_init;
 
     llama_cparams cparams;
 
@@ -286,7 +307,12 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    llama_memory_ptr memory;
+    std::shared_ptr<llama_memory_i> memory;
+    std::shared_ptr<std::mutex> memory_mutex = std::make_shared<std::mutex>();
+    std::unique_ptr<llama_context_pipeline> pipeline;
+    llama_context_pipeline * pipeline_lane = nullptr;
+    std::unique_lock<std::mutex> * pipeline_lock = nullptr;
+    size_t pipeline_ticket = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

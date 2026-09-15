@@ -9,6 +9,13 @@
 #include <cstdint>
 #include <map>
 
+// The callback runs on the caller thread. It owns the batch storage until the next callback for that lane.
+// A null next_batch means that the lane must stop after consuming its output.
+using llama_pipeline_callback = bool (*)(void * data, uint32_t lane, llama_context * worker, bool has_output, llama_batch * next_batch);
+LLAMA_API uint32_t llama_pipeline_n_workers(const llama_context * ctx);
+LLAMA_API uint32_t llama_pipeline_n_ubatch(const llama_context * ctx);
+LLAMA_API int32_t llama_pipeline_stream(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, void * data);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
