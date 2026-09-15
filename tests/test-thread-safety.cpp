@@ -39,10 +39,13 @@ static int test_pipeline(int argc, char ** argv) {
     pipeline_require(init && init->model(), "model");
     auto * model = init->model();
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const std::vector<int> prefixes = {64, 128, 256, 384};
-    const int seqs = 4;
+    const int workers = params.n_parallel > 1 ? params.n_parallel : 2;
+    pipeline_require(workers <= 8, "worker count");
+    const int seqs = std::max(4, workers);
     const int ubatch = 64;
-    const int workers = 2;
+    std::vector<int> prefixes(seqs);
+    for (int seq = 0; seq < seqs; ++seq) { prefixes[seq] = seq == 0 ? 64 : 128*seq; }
+    std::printf("Pipeline test: workers = %d, sequences = %d\n", workers, seqs);
     auto cp = common_context_params_to_llama(params);
     cp.n_ctx = 4096;
     cp.n_seq_max = seqs;
@@ -59,13 +62,13 @@ static int test_pipeline(int argc, char ** argv) {
     auto tokens = common_tokenize(llama_model_get_vocab(model), text, true, false);
     auto token = [&](int seq, int pos) { return tokens[(size_t(seq)*4096 + pos)%tokens.size()]; };
     auto batch = llama_batch_init(cp.n_batch, 0, 1);
-    auto prefill = [&] {
+    auto prefill = [&](bool all_outputs = false) {
         std::vector<float> logits;
         for (int seq = 0; seq < seqs; ++seq) {
             for (int pos = 0; pos < prefixes[seq];) {
                 const int count = std::min(ubatch, prefixes[seq] - pos);
                 common_batch_clear(batch);
-                for (int j = 0; j < count; ++j) { common_batch_add(batch, token(seq, pos + j), pos + j, {seq}, pos + j == prefixes[seq] - 1); }
+                for (int j = 0; j < count; ++j) { common_batch_add(batch, token(seq, pos + j), pos + j, {seq}, all_outputs || pos + j == prefixes[seq] - 1); }
                 pipeline_require(llama_decode(owner.get(), batch) == 0, "prefill");
                 pos += count;
             }
@@ -80,6 +83,14 @@ static int test_pipeline(int argc, char ** argv) {
     const double prefill_error = pipeline_difference(reference, prefill());
     std::printf("Pipeline prefill: max_abs = %.9g\n", prefill_error);
     pipeline_require(prefill_error < 0.02, "pipeline prefill differs from synchronous decode");
+    owner->set_pipeline(0, ubatch);
+    llama_memory_clear(llama_get_memory(owner.get()), true);
+    const auto all_reference = prefill(true);
+    owner->set_pipeline(workers, ubatch);
+    llama_memory_clear(llama_get_memory(owner.get()), true);
+    const double all_error = pipeline_difference(all_reference, prefill(true));
+    std::printf("Pipeline all-output prefill: max_abs = %.9g\n", all_error);
+    pipeline_require(all_error < 0.02, "pipeline all-output prefill differs from synchronous decode");
     owner->set_pipeline(0, ubatch);
     llama_synchronize(owner.get());
     std::vector<std::vector<uint8_t>> states(seqs);
