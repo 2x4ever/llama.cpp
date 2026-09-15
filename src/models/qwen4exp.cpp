@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -478,7 +479,20 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (visible) {
+            mctx->set_qsa_inputs(ratio, *ubatch, blk_cells, visible, tail, nullptr, nullptr, nullptr);
+            const auto & batch = mctx->get_qsa(ratio);
+            for (const auto & chunk : updates) {
+                const int64_t count = chunk.pos->ne[0]/4;
+                std::memcpy(chunk.cells->data, batch.update_cells.data() + ratio*chunk.start, ggml_nbytes(chunk.cells));
+                for (int k = 0; k < 4; ++k) {
+                    std::memcpy((int32_t *) chunk.pos->data + k*count, batch.update_pos.data() + k*batch.n_updates + chunk.start, count*sizeof(int32_t));
+                }
+                if (chunk.ids) { std::memcpy(chunk.ids->data, batch.update_ids.data() + chunk.start, ggml_nbytes(chunk.ids)); }
+            }
+        } else {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -491,7 +505,7 @@ public:
 
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        const int64_t n_blocks = visible ? mctx->get_qsa(ratio).n_blocks : (n_kv + ratio - 1)/ratio;
 
         bool res = true;
 
@@ -501,9 +515,17 @@ public:
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        if (visible) {
+            res &= stream == mctx->get_qsa(ratio).stream;
+            res &= cached == mctx->get_qsa(ratio).cached;
+            res &= n_updates == mctx->get_qsa(ratio).n_updates;
+            res &= visible->ne[0] == (n_blocks + 31)/32;
+            res &= visible->ne[1] == params.ubatch.n_tokens/n_stream;
+        } else {
+            res &= blk_pos->ne[0] == 4*n_blocks*n_stream;
+            res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+        }
 
         return res;
     }
@@ -514,6 +536,20 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+
+    ggml_tensor * visible = nullptr;
+    ggml_tensor * tail = nullptr;
+    static constexpr int64_t update_chunk_size = 8192;
+    struct update_chunk {
+        int64_t start;
+        ggml_tensor * cells;
+        ggml_tensor * pos;
+        ggml_tensor * ids;
+    };
+    std::vector<update_chunk> updates;
+    int64_t n_updates = 0;
+    bool cached = false;
+    uint32_t stream = 0;
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -531,6 +567,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
+    const bool native = mctx_hyb->qsa_enabled() && cparams.flash_attn && cparams.causal_attn &&
+        !hparams.use_alibi && !hparams.attn_soft_cap;
     const int64_t idx_dim  = hparams.indexer_head_size;
     const int64_t n_idx_h  = hparams.indexer_n_head;
     const int64_t r        = hparams.dsv4_compress_ratios[il];
@@ -538,7 +576,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     GGML_ASSERT(r > 0);
 
-    const int64_t n_blocks = (n_kv + r - 1)/r;
+    const int64_t n_blocks = native ? mctx_hyb->get_qsa(r).n_blocks : (n_kv + r - 1)/r;
 
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();
@@ -565,13 +603,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        if (native) {
+            const auto & batch = mctx_hyb->get_qsa(r);
+            qsa->stream = batch.stream;
+            qsa->cached = batch.cached;
+            qsa->n_updates = batch.n_updates;
+            for (int64_t start = 0; start < batch.n_updates; start += llm_graph_input_qsa::update_chunk_size) {
+                const int64_t count = std::min(llm_graph_input_qsa::update_chunk_size, batch.n_updates - start);
+                llm_graph_input_qsa::update_chunk chunk{start,
+                    ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*count),
+                    ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*count),
+                    batch.cached ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, count) : nullptr};
+                ggml_set_input(chunk.cells);
+                ggml_set_input(chunk.pos);
+                if (chunk.ids) { ggml_set_input(chunk.ids); }
+                qsa->updates.push_back(chunk);
+            }
+            qsa->visible = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, (n_blocks + 31)/32, n_tps, n_stream);
+            qsa->tail = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r - 1, n_tps, n_stream);
+            ggml_set_input(qsa->visible);
+            ggml_set_input(qsa->tail);
+        } else {
+            qsa->blk_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+            ggml_set_input(qsa->blk_pos);
+            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        }
 
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        if (qsa->bias) { ggml_set_input(qsa->bias); }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -585,36 +645,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
 
-    // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
-    ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
-    k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
-
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
-
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
     ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    if (native) {
+        const auto & batch = mctx_hyb->get_qsa(r);
+        ggml_tensor * cache = batch.cached ? mctx_hyb->get_qsa_keys(il) : nullptr;
+        ggml_tensor * target = cache ? ggml_reshape_2d(ctx0, cache, idx_dim, ggml_nelements(cache)/idx_dim) :
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, batch.n_updates);
+        // Bound the temporary storage needed after a cache invalidation.
+        for (const auto & input : inp->updates) {
+            const int64_t count = input.pos->ne[0]/4;
+            const int64_t start = input.start;
+            ggml_tensor * raw = mctx_hyb->get_qsa_raw(il);
+            raw = ggml_reshape_2d(ctx0, raw, idx_dim, ggml_nelements(raw)/idx_dim);
+            ggml_tensor * members = ggml_get_rows(ctx0, raw, input.cells);
+            members = ggml_reshape_3d(ctx0, members, idx_dim, r, count);
+            ggml_tensor * chunk = nullptr;
+            for (int64_t j = 0; j < r; ++j) {
+                ggml_tensor * slice = ggml_cont(ctx0, ggml_view_2d(ctx0, members, idx_dim, count,
+                        members->nb[2], j*members->nb[1]));
+                chunk = chunk ? ggml_add(ctx0, chunk, slice) : slice;
+            }
+            chunk = ggml_scale(ctx0, chunk, 1.0f/(float) r);
+            chunk = build_norm(chunk, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+            chunk = ggml_reshape_3d(ctx0, chunk, idx_dim, 1, count);
+            chunk = ggml_rope_multi(ctx0, chunk, input.pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            chunk = ggml_reshape_2d(ctx0, chunk, idx_dim, count);
+            if (batch.cached) {
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, target, chunk, input.ids));
+            } else {
+                auto * dst = ggml_view_2d(ctx0, target, idx_dim, count, target->nb[1], start*target->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, chunk, dst));
+            }
+        }
+        if (batch.cached) {
+            pooled = ggml_view_3d(ctx0, cache, idx_dim, n_blocks, n_stream,
+                    cache->nb[1], cache->nb[2], batch.stream*cache->nb[2]);
+        } else {
+            pooled = ggml_reshape_3d(ctx0, target, idx_dim, n_blocks, n_stream);
+        }
+        cb(pooled, "indexer_k", il);
+    } else {
+        // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
+        ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
+        k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+
+        // gathers per stream: blk_cells row s indexes stream s's own cells
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+
+        // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+        cb(pooled, "indexer_k_pooled", il);
+
+        // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+        pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        cb(pooled, "indexer_k", il);
+
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
-
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
-    cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -623,6 +726,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
+
+    if (native) {
+        GGML_ASSERT(hparams.indexer_top_k % r == 0);
+        const int budget = std::min<int64_t>(n_blocks, hparams.indexer_top_k/r);
+        ggml_tensor * cells = ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream);
+        ggml_tensor * queries = ggml_reshape_4d(ctx0, q, idx_dim, n_idx_h, n_tps, n_stream);
+        ggml_tensor * selected = ggml_qsa_indexer(ctx0, pooled, queries, cells, inp->visible, inp->tail, budget);
+        cb(selected, "indexer_top_k", il);
+        return selected;
+    }
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -647,7 +760,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         score = ggml_add(ctx0, score, inp->bias);
     }
 
-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+    // Every token of a block gets the block score; top-k can cut the last selected block.
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
@@ -661,7 +774,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
     cb(expanded, "indexer_score_tokens", il);
 
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    // The reference returns indexer_top_k + compress_ratio - 1 individual tokens.
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
@@ -710,6 +823,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    if (top_k->op == GGML_OP_QSA_SELECT) {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+        const int64_t ns = k->ne[3];
+        ggml_tensor * q = ggml_view_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]/ns, ns,
+                q_cur->nb[1], q_cur->nb[2], q_cur->nb[3]/ns, 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        GGML_ASSERT(k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0));
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_indices(cur, top_k);
+        cb(cur, "qsa_attn", il);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (inp->self_v_rot) { cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot); }
+        return cur;
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();

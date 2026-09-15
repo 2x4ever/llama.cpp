@@ -52,7 +52,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_QSA_ATTN);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1003,6 +1003,7 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * indices = dst->src[5];
 
     ggml_tensor * KQV = dst;
 
@@ -1109,7 +1110,7 @@ void launch_fattn(
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
     const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
-    if (use_sparse) {
+    if (use_sparse && !indices) {
         GGML_ASSERT(mask != nullptr);
         GGML_ASSERT(n_kv_max > 0);
         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
@@ -1259,13 +1260,13 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        indices ? (const int *) indices->data : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? (compact_mask ? Q->ne[1] : mask->ne[1]) : 0, mask && !compact_mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        indices ? indices->ne[1] : (mask ? (compact_mask ? Q->ne[1] : mask->ne[1]) : 0), mask && !compact_mask ? mask->ne[2] : 0, indices ? indices->ne[3] : (mask ? mask->ne[3] : 0),
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
