@@ -6475,6 +6475,7 @@ struct test_argsort : public test_case {
 struct test_qsa_select : public test_case {
     const int64_t n_blocks;
     const bool indexer;
+    int budget() const { return n_blocks == 513 ? 512 : std::min<int64_t>(17, n_blocks); }
 
     test_qsa_select(int64_t n_blocks, bool indexer) : n_blocks(n_blocks), indexer(indexer) {}
 
@@ -6494,11 +6495,11 @@ struct test_qsa_select : public test_case {
             keys = ggml_view_3d(ctx, keys, 8, n_blocks, 2, keys->nb[1], keys->nb[2], 0);
             auto * queries = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 8, 2, 35, 2);
             ggml_set_name(queries, "queries");
-            return ggml_qsa_indexer(ctx, keys, queries, cells, visible, tail, 17);
+            return ggml_qsa_indexer(ctx, keys, queries, cells, visible, tail, budget());
         }
         auto * scores = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 35, 2);
         ggml_set_name(scores, "scores");
-        return ggml_qsa_select(ctx, scores, cells, visible, tail, 17);
+        return ggml_qsa_select(ctx, scores, cells, visible, tail, budget());
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -6516,8 +6517,8 @@ struct test_qsa_select : public test_case {
                 std::vector<int32_t> data(ggml_nelements(t), -1);
                 for (size_t i = 0; i < data.size(); ++i) {
                     if (name == "cells") { data[i] = (4*n_blocks - 1 - i%(4*n_blocks)); }
-                    if (name == "visible") { data[i] = (i/t->ne[0])%7 == 6 ? 0 : 0x55555555; }
-                    if (name == "tail" && i%3 == 0) { data[i] = 4*n_blocks; }
+                    if (name == "visible") { data[i] = (i/t->ne[0])%7 == 6 ? 0 : (i/t->ne[0])%2 ? -1 : 0x55555555; }
+                    if (name == "tail" && int(i%3) >= 3 - int((i/3)%4)) { data[i] = 4*n_blocks + i%3; }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             }
@@ -10749,7 +10750,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (int64_t n_blocks : {33, 4097}) {
+    for (int64_t n_blocks : {1, 33, 513, 4097}) {
         for (bool indexer : {false, true}) {
             test_cases.emplace_back(new test_qsa_select(n_blocks, indexer));
         }

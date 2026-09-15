@@ -9388,18 +9388,28 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
                 order[count++] = b;
             }
         }
-        const int take = std::min(count, k);
+        const auto * tail = (const int32_t *) dst->src[3]->data + row*(r - 1);
+        int n_tail = 0;
+        for (int j = 0; j < r - 1; ++j) { n_tail += tail[j] >= 0; }
+        const int take = std::min(count, k + 1);
         const auto cmp = [&](int a, int b) { return score[a] > score[b] || (score[a] == score[b] && a < b); };
         std::partial_sort(order, order + take, order + count, cmp);
+        const int boundary = take > k ? order[k] : -1;
+        const int extra = boundary >= 0 ? r - 1 - n_tail : 0;
         std::sort(order, order + take);
         auto * out = (int32_t *) dst->data + row*dst->ne[0];
         std::fill(out, out + dst->ne[0], -1);
         const auto * members = (const int32_t *) cells->data + (row/nq)*nb*r;
+        int at = 0;
         for (int i = 0; i < take; ++i) {
-            std::copy_n(members + order[i]*r, r, out + i*r);
+            const int n = order[i] == boundary ? extra : r;
+            std::copy_n(members + order[i]*r, n, out + at);
+            at += n;
         }
-        const auto * tail = (const int32_t *) dst->src[3]->data + row*(r - 1);
-        std::copy_n(tail, r - 1, out + k*r);
+        at = k*r + extra;
+        for (int j = 0; j < r - 1; ++j) {
+            if (tail[j] >= 0) { out[at++] = tail[j]; }
+        }
     }
 }
 

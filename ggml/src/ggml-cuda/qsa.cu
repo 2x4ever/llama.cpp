@@ -18,20 +18,29 @@ static __global__ void qsa_mask_scores(const float * score, const uint32_t * bit
     masked[i] = (bits[int64_t(row)*words + b/32] & (uint32_t(1) << (b%32))) && isfinite(x) ? x : -INFINITY;
 }
 
-static __global__ void qsa_expand(const float * masked, const int * chosen, const int * cells, const int * tail,
-        int * out, int nb, int nq, int r, int k, int start, int rows) {
+static __global__ void qsa_expand(const int * chosen, const int * partial, const int * cells, const int * tail,
+        int * out, int nb, int nq, int r, int k, int count, int start, int rows) {
     const int width = k*r + r - 1;
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i >= int64_t(width)*rows) { return; }
     const int row = i/width, j = i%width, original_row = start + row;
+    const int * row_tail = tail + int64_t(original_row)*(r - 1);
+    int n_tail = 0;
+    for (int t = 0; t < r - 1; ++t) { n_tail += row_tail[t] >= 0; }
+    const int cut = partial[row], extra = cut >= 0 ? r - 1 - n_tail : 0;
     int cell = -1;
-    if (j < k*r) {
-        const int b = chosen[int64_t(row)*k + j/r];
-        if (b < nb && isfinite(masked[int64_t(row)*nb + b])) {
-            cell = cells[(int64_t(original_row/nq)*nb + b)*r + j%r];
+    if (j < k*r + extra) {
+        // The boundary block contributes only the tokens left after the tail.
+        const int at = cut >= 0 && j >= cut*r + extra ? j + r - extra : j;
+        const int b = chosen[int64_t(row)*count + at/r];
+        if (b >= 0 && b < nb) {
+            cell = cells[(int64_t(original_row/nq)*nb + b)*r + at%r];
         }
     } else {
-        cell = tail[int64_t(original_row)*(r - 1) + j - k*r];
+        int at = j - k*r - extra;
+        for (int t = 0; t < r - 1; ++t) {
+            if (row_tail[t] >= 0 && at-- == 0) { cell = row_tail[t]; break; }
+        }
     }
     out[int64_t(original_row)*width + j] = cell;
 }
@@ -45,12 +54,38 @@ static __global__ void qsa_reduce_scores(const float * dots, const uint32_t * bi
     masked[i] = bits[int64_t(row)*words + b/32] & (uint32_t(1) << (b%32)) ? sum : -INFINITY;
 }
 
-static __global__ void qsa_order(const float * scores, int * chosen, int nb, int k, int padded) {
+static __global__ void qsa_order(const float * scores, int * chosen, int * partial, int nb, int k, int count, int padded) {
     extern __shared__ int ids[];
+    __shared__ float reduction[32];
+    __shared__ int boundary;
     const int row = blockIdx.x;
+    if (threadIdx.x == 0) {
+        boundary = -1;
+        partial[row] = -1;
+    }
+    __syncthreads();
+    if (count > k) {
+        float worst = INFINITY;
+        int worst_id = -1;
+        for (int i = threadIdx.x; i < count; i += blockDim.x) {
+            const int b = chosen[int64_t(row)*count + i];
+            const float score = b >= 0 && b < nb ? scores[int64_t(row)*nb + b] : -INFINITY;
+            const float x = isfinite(score) ? score : -INFINITY;
+            if (x < worst || (x == worst && b > worst_id)) {
+                worst = x;
+                worst_id = b;
+            }
+        }
+        const float lowest = -block_reduce<block_reduce_method::MAX>(-worst, reduction);
+        if (worst == lowest) { atomicMax(&boundary, worst_id); }
+        __syncthreads();
+    }
+    const int full = min(count, k);
+    const bool has_partial = boundary >= 0 && boundary < nb && isfinite(scores[int64_t(row)*nb + boundary]);
     for (int i = threadIdx.x; i < padded; i += blockDim.x) {
-        const int b = i < k ? chosen[int64_t(row)*k + i] : INT_MAX;
-        ids[i] = b < nb && isfinite(scores[int64_t(row)*nb + b]) ? b : INT_MAX;
+        int b = i < full ? chosen[int64_t(row)*count + i] : INT_MAX;
+        if (i < full && b == boundary) { b = chosen[int64_t(row)*count + full]; }
+        ids[i] = b >= 0 && b < nb && isfinite(scores[int64_t(row)*nb + b]) ? b : INT_MAX;
     }
     __syncthreads();
     for (int span = 2; span <= padded; span *= 2) {
@@ -67,7 +102,23 @@ static __global__ void qsa_order(const float * scores, int * chosen, int nb, int
             __syncthreads();
         }
     }
-    for (int i = threadIdx.x; i < k; i += blockDim.x) { chosen[int64_t(row)*k + i] = ids[i]; }
+    // Sort only full blocks, then insert the boundary in logical order.
+    for (int i = threadIdx.x; i < full; i += blockDim.x) {
+        const int b = ids[i];
+        chosen[int64_t(row)*count + i + (has_partial && b > boundary)] = b;
+        if (has_partial && b > boundary && (i == 0 || ids[i - 1] < boundary)) {
+            chosen[int64_t(row)*count + i] = boundary;
+            partial[row] = i;
+        }
+    }
+    if (threadIdx.x == 0 && count > full) {
+        if (!has_partial) {
+            chosen[int64_t(row)*count + full] = INT_MAX;
+        } else if (ids[full - 1] < boundary) {
+            chosen[int64_t(row)*count + full] = boundary;
+            partial[row] = full;
+        }
+    }
 }
 
 static void qsa_shape(ggml_tensor & t, int n0, int n1) {
@@ -83,11 +134,13 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int r = dst->src[1]->ne[0], k = ggml_get_op_params_i32(dst, 0), words = (nb + 31)/32;
     const int heads = queries ? queries->ne[1] : 1;
     const int tile = std::min(nq, 32);
+    const int count_blocks = std::min(nb, k + 1);
     int padded = 1;
-    while (padded < k) { padded *= 2; }
+    while (padded < std::min(nb, k)) { padded *= 2; }
     ggml_cuda_pool_alloc<float> dots(ctx.pool(), queries ? size_t(nb)*heads*tile : 1);
     ggml_cuda_pool_alloc<float> masked(ctx.pool(), size_t(nb)*tile);
-    ggml_cuda_pool_alloc<int> chosen(ctx.pool(), size_t(k)*tile);
+    ggml_cuda_pool_alloc<int> chosen(ctx.pool(), size_t(count_blocks)*tile);
+    ggml_cuda_pool_alloc<int> partial(ctx.pool(), tile);
     for (int start = 0; start < rows;) {
         const int count = std::min(tile, nq - start%nq);
         if (queries) {
@@ -112,12 +165,12 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         }
         ggml_tensor input = *scores, selected = *dst;
         qsa_shape(input, nb, count); input.data = masked.ptr;
-        qsa_shape(selected, k, count); selected.data = chosen.ptr; selected.src[0] = &input;
+        qsa_shape(selected, count_blocks, count); selected.data = chosen.ptr; selected.src[0] = &input;
         ggml_cuda_op_top_k(ctx, &selected);
         // Visit selected blocks in ID order, independent of their scores.
-        qsa_order<<<count, 256, padded*sizeof(int), ctx.stream()>>>(masked.ptr, chosen.ptr, nb, k, padded);
-        qsa_expand<<<(int64_t(dst->ne[0])*count + 255)/256, 256, 0, ctx.stream()>>>(masked.ptr, chosen.ptr,
-            (const int *) dst->src[1]->data, (const int *) dst->src[3]->data, (int *) dst->data, nb, nq, r, k, start, count);
+        qsa_order<<<count, 256, padded*sizeof(int), ctx.stream()>>>(masked.ptr, chosen.ptr, partial.ptr, nb, k, count_blocks, padded);
+        qsa_expand<<<(int64_t(dst->ne[0])*count + 255)/256, 256, 0, ctx.stream()>>>(chosen.ptr, partial.ptr,
+            (const int *) dst->src[1]->data, (const int *) dst->src[3]->data, (int *) dst->data, nb, nq, r, k, count_blocks, start, count);
         start += count;
     }
     CUDA_CHECK(cudaGetLastError());
