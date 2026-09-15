@@ -902,6 +902,7 @@ private:
         llama_context * target = nullptr;
     };
     std::vector<mtp_pipeline_lane> mtp_lanes;
+    common_speculative_mtp_batcher_ptr mtp_batcher;
 
     bool add_bos_token = true;
 
@@ -946,6 +947,7 @@ private:
 
     void destroy() {
         mtp_lanes.clear();
+        mtp_batcher.reset();
         spec.reset();
         spec_init.reset();
 
@@ -2835,12 +2837,24 @@ private:
         const size_t width = (active.size() + n_workers - 1)/n_workers;
         if (width*step_size > llama_pipeline_n_ubatch(ctx_tgt)) { return false; }
         if (mtp) {
+            const char * concurrent_env = std::getenv("LLAMA_PIPELINE_MTP_CONCURRENT");
+            const bool concurrent = concurrent_env && std::atoi(concurrent_env) != 0;
+            const char * batching = std::getenv("LLAMA_PIPELINE_MTP_BATCH");
+            if (!concurrent && !mtp_batcher && batching && std::atoi(batching) != 0) {
+                mtp_batcher = common_speculative_mtp_batcher_init(ctx_dft);
+                SRV_INF("%s", "MTP ready-step batching enabled: shared draft executor, no coalescing delay\n");
+            }
             mtp_lanes.resize(n_workers);
             for (auto & lane : mtp_lanes) {
                 if (!lane.draft) {
                     const uint32_t n_batch = std::min<uint32_t>(llama_n_batch(ctx_dft), slots.size()*step_size);
-                    lane.draft.reset(llama_context_create_shared(ctx_dft, n_batch, std::min(n_batch, llama_n_ubatch(ctx_dft))));
+                    lane.draft.reset(llama_context_create_shared(ctx_dft, n_batch,
+                            concurrent ? n_batch : std::min(n_batch, llama_n_ubatch(ctx_dft)), concurrent));
                     if (!lane.draft) { throw std::runtime_error("failed to create shared MTP context"); }
+                    if (concurrent) {
+                        SRV_INF("MTP concurrent draft lane %zu enabled: shared weights and KV, private scratch and backend streams, ubatch = %u\n",
+                                size_t(&lane - mtp_lanes.data()), n_batch);
+                    }
                 }
             }
         }
@@ -2879,7 +2893,7 @@ private:
                         auto & mtp = server.mtp_lanes[id];
                         if (mtp.target != worker) {
                             mtp.spec.reset();
-                            mtp.spec = common_speculative_clone_mtp(server.spec.get(), worker, mtp.draft.get());
+                            mtp.spec = common_speculative_clone_mtp(server.spec.get(), worker, mtp.draft.get(), server.mtp_batcher);
                             mtp.target = worker;
                             SRV_INF("MTP pipeline lane %u active: shared draft weights and KV, independent draft/verify execution\n", id);
                         }
