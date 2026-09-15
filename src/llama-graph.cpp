@@ -3500,7 +3500,6 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
@@ -3520,6 +3519,14 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_cpy(ctx0,
             states_extra,
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+
+    // Inactive sequences may still need their rollback history after moving.
+    for (int64_t group = 1; n_rs > uint32_t(n_seqs) && group*rs_size < s->ne[1]; ++group) {
+        auto * history = ggml_view_2d(ctx0, s, state_size, rs_size, s->nb[1], group*rs_size*s->nb[1]);
+        auto * extra = ggml_get_rows(ctx0, history, state_copy_extra);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, extra,
+                ggml_view_2d(ctx0, s, state_size, n_rs - n_seqs, s->nb[1], (group*rs_size + rs_head + n_seqs)*s->nb[1])));
+    }
 
     return output_states;
 }
