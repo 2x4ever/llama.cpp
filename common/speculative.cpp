@@ -1515,7 +1515,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0 && batch_in.pos[i_batch_beg[seq_id]] == 0) {
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
@@ -1529,7 +1536,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1588,7 +1594,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = h_tgt + (size_t) (i_batch_beg[seq_id] + i) * n_embd;
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -1763,6 +1769,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || (size_t) seq_id >= pending_h.size()) { return false; }
+        const uint32_t header[] = {0x3150544d, uint32_t(n_embd)};
+        data.resize(sizeof(header) + pending_h[seq_id].size()*sizeof(float));
+        std::memcpy(data.data(), header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), pending_h[seq_id].data(), data.size() - sizeof(header));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        uint32_t header[2];
+        if (data.size() < sizeof(header)) { return; }
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x3150544d) { return; }
+        if (seq_id < 0 || (size_t) seq_id >= pending_h.size() || header[1] != uint32_t(n_embd) || data.size() != sizeof(header) + pending_h[seq_id].size()*sizeof(float)) {
+            throw std::invalid_argument("invalid MTP hidden state");
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), data.size() - sizeof(header));
     }
 };
 
@@ -2191,6 +2217,31 @@ struct common_speculative {
 
     std::vector<double> synth_probs;
 };
+
+bool common_speculative_supports_pipeline(const common_speculative * spec) {
+    if (!spec || spec->impls.size() != 1 || spec->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        return false;
+    }
+    const auto & mtp = static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]);
+    return mtp.n_mtp_layers == 1 && !mtp.is_mem_shared && !mtp.chain_heads;
+}
+
+common_speculative_ptr common_speculative_clone_mtp(const common_speculative * spec, llama_context * ctx_tgt, llama_context * ctx_dft) {
+    if (!common_speculative_supports_pipeline(spec)) { return {}; }
+    const auto & source = static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]);
+    common_params_speculative params;
+    params.draft = source.params;
+    params.draft.ctx_tgt = ctx_tgt;
+    params.draft.ctx_dft = ctx_dft;
+    auto result = std::make_unique<common_speculative>();
+    result->dparams.resize(spec->dparams.size());
+    result->impl_last.resize(spec->dparams.size(), nullptr);
+    result->synth_probs = spec->synth_probs;
+    auto impl = std::make_unique<common_speculative_impl_draft_mtp>(params, spec->dparams.size());
+    impl->pending_h = source.pending_h;
+    result->impls.push_back(std::move(impl));
+    return common_speculative_ptr(result.release());
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
