@@ -82,6 +82,9 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    // Drain shared executors before public operations change memory data.
+    std::function<void()> on_synchronize;
+
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result

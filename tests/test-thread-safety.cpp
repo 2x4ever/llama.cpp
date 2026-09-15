@@ -12,8 +12,198 @@
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
+#include "../src/llama-context.h"
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
+static void pipeline_require(bool ok, const char * message) {
+    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
+}
+static double pipeline_difference(const std::vector<float> & a, const std::vector<float> & b) {
+    pipeline_require(a.size() == b.size(), "logit shape");
+    double d = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        pipeline_require(std::isfinite(a[i]) && std::isfinite(b[i]), "finite logits");
+        d = std::max(d, double(std::abs(a[i] - b[i])));
+    }
+    return d;
+}
+static int test_pipeline(int argc, char ** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    common_init();
+    common_params params;
+    pipeline_require(common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON), "arguments");
+    llama_backend_init();
+    auto init = common_init_from_params(params, true);
+    pipeline_require(init && init->model(), "model");
+    auto * model = init->model();
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int workers = params.n_parallel > 1 ? params.n_parallel : 2;
+    pipeline_require(workers <= 8, "worker count");
+    const int seqs = std::max(4, workers);
+    const int ubatch = 64;
+    std::vector<int> prefixes(seqs);
+    for (int seq = 0; seq < seqs; ++seq) { prefixes[seq] = seq == 0 ? 64 : 128*seq; }
+    std::printf("Pipeline test: workers = %d, sequences = %d\n", workers, seqs);
+    auto cp = common_context_params_to_llama(params);
+    cp.n_ctx = 4096;
+    cp.n_seq_max = seqs;
+    cp.n_batch = std::max(1024, ubatch);
+    cp.n_ubatch = ubatch;
+    cp.n_rs_seq = 0;
+    cp.n_threads = cp.n_threads_batch = 4;
+    cp.kv_unified = true;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr owner(llama_init_from_model(model, cp));
+    pipeline_require(bool(owner), "context");
+    std::string text;
+    for (int i = 0; i < 1024; ++i) { text += "Pipeline validation paragraph " + std::to_string(i) + ": the river flows through the valley. Calculate 123 + 456 and explain the result.\n"; }
+    auto tokens = common_tokenize(llama_model_get_vocab(model), text, true, false);
+    auto token = [&](int seq, int pos) { return tokens[(size_t(seq)*4096 + pos)%tokens.size()]; };
+    auto batch = llama_batch_init(cp.n_batch, 0, 1);
+    auto prefill = [&](bool all_outputs = false) {
+        std::vector<float> logits;
+        for (int seq = 0; seq < seqs; ++seq) {
+            for (int pos = 0; pos < prefixes[seq];) {
+                const int count = std::min(ubatch, prefixes[seq] - pos);
+                common_batch_clear(batch);
+                for (int j = 0; j < count; ++j) { common_batch_add(batch, token(seq, pos + j), pos + j, {seq}, all_outputs || pos + j == prefixes[seq] - 1); }
+                pipeline_require(llama_decode(owner.get(), batch) == 0, "prefill");
+                pos += count;
+            }
+            const float * row = llama_get_logits_ith(owner.get(), -1);
+            logits.insert(logits.end(), row, row + vocab);
+        }
+        return logits;
+    };
+    const auto reference = prefill();
+    owner->set_pipeline(workers, ubatch);
+    llama_memory_clear(llama_get_memory(owner.get()), true);
+    const double prefill_error = pipeline_difference(reference, prefill());
+    std::printf("Pipeline prefill: max_abs = %.9g\n", prefill_error);
+    pipeline_require(prefill_error < 0.02, "pipeline prefill differs from synchronous decode");
+    owner->set_pipeline(0, ubatch);
+    llama_memory_clear(llama_get_memory(owner.get()), true);
+    const auto all_reference = prefill(true);
+    owner->set_pipeline(workers, ubatch);
+    llama_memory_clear(llama_get_memory(owner.get()), true);
+    const double all_error = pipeline_difference(all_reference, prefill(true));
+    std::printf("Pipeline all-output prefill: max_abs = %.9g\n", all_error);
+    pipeline_require(all_error < 0.02, "pipeline all-output prefill differs from synchronous decode");
+    owner->set_pipeline(0, ubatch);
+    llama_synchronize(owner.get());
+    std::vector<std::vector<uint8_t>> states(seqs);
+    for (int seq = 0; seq < seqs; ++seq) {
+        states[seq].resize(llama_state_seq_get_size(owner.get(), seq));
+        pipeline_require(llama_state_seq_get_data(owner.get(), states[seq].data(), states[seq].size(), seq) == states[seq].size(), "save");
+    }
+    const auto memory_size = llama_get_memory(owner.get())->memory_breakdown();
+    struct execution {
+        std::vector<int> ids, positions;
+        std::vector<llama_token> tokens;
+        std::vector<float> logits;
+    };
+    auto restore = [&] {
+        llama_synchronize(owner.get());
+        llama_memory_clear(llama_get_memory(owner.get()), true);
+        for (int seq = 0; seq < seqs; ++seq) {
+            pipeline_require(llama_state_seq_set_data(owner.get(), states[seq].data(), states[seq].size(), seq) == states[seq].size(), "restore");
+        }
+    };
+    for (const std::string scenario : {"uneven", "exception", "duplicate", "reuse"}) {
+        owner->set_pipeline(workers, ubatch);
+        restore();
+        struct state {
+            int seqs, workers, vocab;
+            std::vector<int> prefixes;
+            std::vector<llama_batch> batches;
+            std::vector<int> step, limit, last;
+            std::vector<execution> trace;
+            const std::vector<llama_token> * text;
+            std::string scenario;
+            int completions = 0;
+        } data{seqs, workers, vocab, prefixes, {}, std::vector<int>(seqs, 0), {}, std::vector<int>(workers, -1), {}, &tokens, scenario};
+        for (int i = 0; i < seqs; ++i) { data.limit.push_back(3 + (i*7)%16); }
+        for (int i = 0; i < workers; ++i) { data.batches.push_back(llama_batch_init(seqs, 0, 1)); }
+        bool threw = false;
+        try {
+            pipeline_require(llama_pipeline_stream(owner.get(), 24,
+                [](void * ptr, uint32_t lane, llama_context * output, bool ready, llama_batch * next) {
+                    auto & d = *static_cast<state *>(ptr);
+                    if (ready) {
+                        pipeline_require(d.last[lane] >= 0, "submitted output");
+                        auto & entry = d.trace[d.last[lane]];
+                        for (int row = 0; row < int(entry.ids.size()); ++row) {
+                            const float * logits = llama_get_logits_ith(output, row);
+                            entry.logits.insert(entry.logits.end(), logits, logits + d.vocab);
+                            ++d.step[entry.ids[row]];
+                        }
+                        if (++d.completions == 2 && d.scenario == "exception") { throw std::runtime_error("injected callback failure"); }
+                    }
+                    if (!next) { return false; }
+                    auto & b = d.batches[lane];
+                    common_batch_clear(b);
+                    execution entry;
+                    for (int seq = lane; seq < d.seqs; seq += d.workers) {
+                        if (d.step[seq] >= d.limit[seq] || (d.scenario == "duplicate" && !entry.ids.empty())) { continue; }
+                        const int id = d.scenario == "duplicate" ? 0 : seq;
+                        const int pos = d.prefixes[seq] + d.step[seq];
+                        const llama_token token = (*d.text)[(size_t(seq)*4096 + pos)%d.text->size()];
+                        common_batch_add(b, token, pos, {id}, true);
+                        entry.ids.push_back(id);
+                        entry.positions.push_back(pos);
+                        entry.tokens.push_back(token);
+                    }
+                    if (!b.n_tokens) { return false; }
+                    d.last[lane] = d.trace.size();
+                    d.trace.push_back(std::move(entry));
+                    *next = b;
+                    return true;
+                }, &data) == 0, "stream result");
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        pipeline_require(threw == (scenario == "exception" || scenario == "duplicate"), "exception contract");
+        // All submitted GPU work must be drained, including callbacks that throw.
+        llama_synchronize(owner.get());
+        double error = 0;
+        if (!threw) {
+            for (int seq = 0; seq < seqs; ++seq) {
+                pipeline_require(data.step[seq] == data.limit[seq], "uneven completion count");
+                pipeline_require(llama_memory_seq_pos_max(llama_get_memory(owner.get()), seq) == prefixes[seq] + data.limit[seq] - 1, "uneven final position");
+            }
+            owner->set_pipeline(0, ubatch);
+            restore();
+            // Replay the exact submitted order and shapes through ordinary synchronous decode.
+            for (const auto & entry : data.trace) {
+                common_batch_clear(batch);
+                for (size_t i = 0; i < entry.ids.size(); ++i) { common_batch_add(batch, entry.tokens[i], entry.positions[i], {entry.ids[i]}, true); }
+                pipeline_require(llama_decode(owner.get(), batch) == 0, "replay decode");
+                std::vector<float> actual;
+                for (size_t row = 0; row < entry.ids.size(); ++row) {
+                    const float * logits = llama_get_logits_ith(owner.get(), row);
+                    actual.insert(actual.end(), logits, logits + vocab);
+                }
+                error = std::max(error, pipeline_difference(entry.logits, actual));
+            }
+            std::fprintf(stderr, "Replay max_abs = %.9g\n", error);
+            pipeline_require(error < 0.02, "pipeline trace differs from synchronous replay");
+        }
+        pipeline_require(llama_get_memory(owner.get())->memory_breakdown() == memory_size, "shared KV size unchanged");
+        std::printf("Pipeline lifecycle: %s, expected exception = %d, max_abs_vs_replay = %.9g, submissions = %zu\n", scenario.c_str(), threw, error, data.trace.size());
+        for (auto b : data.batches) { llama_batch_free(b); }
+    }
+    llama_batch_free(batch);
+    owner.reset();
+    init.reset();
+    llama_backend_free();
+    std::puts("Pipeline lifecycle checks passed");
+    return 0;
+}
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "pipeline") { return test_pipeline(argc - 1, argv + 1); }
     common_params params;
 
     common_init();
