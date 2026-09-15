@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -14,11 +15,157 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
+#include <deque>
+#include <set>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+struct llama_context_pipeline {
+    struct job {
+        llama_batch batch{};
+        std::vector<llama_token> tokens;
+        std::vector<float> embeddings;
+        std::vector<llama_pos> positions;
+        std::vector<int32_t> counts;
+        std::vector<llama_seq_id> sequences;
+        std::vector<llama_seq_id *> sequence_ptrs;
+        std::vector<int8_t> outputs;
+        std::vector<int32_t> output_rows;
+        size_t ticket = 0;
+        int n_threads = 0;
+        int n_threads_batch = 0;
+        bool warmup = false;
+    };
+
+    llama_context & owner;
+    ggml_backend_pipeline_t backend = ggml_backend_pipeline_new();
+    std::unique_ptr<ggml_backend_workspace_pool, decltype(&ggml_backend_workspace_pool_free)> workspace{nullptr, ggml_backend_workspace_pool_free};
+    std::vector<std::unique_ptr<llama_context>> workers;
+    std::vector<std::thread> threads;
+    std::vector<std::deque<job>> jobs;
+    std::mutex work_mutex;
+    std::condition_variable work_cv;
+    std::condition_variable prepare_cv;
+    size_t issued = 0;
+    size_t submitted = 0;
+    size_t completed = 0;
+    size_t next_ticket = 0;
+    uint64_t reused = 0;
+    bool stop = false;
+    std::atomic<bool> failed{false};
+    bool streaming = false;
+    struct stream_job {
+        llama_batch batch{};
+        size_t ticket = 0;
+        bool pending = false;
+        bool busy = false;
+        bool done = false;
+        int result = 0;
+    };
+    std::vector<stream_job> stream_jobs;
+
+    explicit llama_context_pipeline(llama_context & owner) : owner(owner) {}
+
+    ~llama_context_pipeline() {
+        drain();
+        {
+            std::lock_guard<std::mutex> lock(work_mutex);
+            stop = true;
+            work_cv.notify_all();
+        }
+        for (auto & thread : threads) { thread.join(); }
+        ggml_backend_pipeline_free(backend);
+    }
+
+    void drain() {
+        std::unique_lock<std::mutex> lock(work_mutex);
+        work_cv.wait(lock, [&] {
+            return completed == issued && (!streaming || std::none_of(stream_jobs.begin(), stream_jobs.end(), [](const auto & job) { return job.busy; }));
+        });
+        owner.n_reused += reused;
+        reused = 0;
+        ggml_backend_pipeline_reset(backend);
+    }
+
+    void run(size_t lane) {
+        std::unique_lock<std::mutex> lock(work_mutex);
+        while (true) {
+            work_cv.wait(lock, [&] { return stop || (streaming ? stream_jobs[lane].pending : !jobs[lane].empty()); });
+            if (stop) { return; }
+            if (streaming) {
+                auto batch = stream_jobs[lane].batch;
+                workers[lane]->pipeline_ticket = stream_jobs[lane].ticket;
+                stream_jobs[lane].pending = false;
+                lock.unlock();
+                int ret = -3;
+                try {
+                    ret = workers[lane]->decode(batch);
+                    workers[lane]->synchronize();
+                } catch (const std::exception & error) {
+                    ret = -3;
+                    workers[lane]->synchronize();
+                    LLAMA_LOG_ERROR("%s: pipeline lane failed: %s\n", __func__, error.what());
+                }
+                lock.lock();
+                stream_jobs[lane].result = ret;
+                stream_jobs[lane].busy = false;
+                stream_jobs[lane].done = true;
+                work_cv.notify_all();
+                continue;
+            }
+            auto task = std::move(jobs[lane].front());
+            jobs[lane].pop_front();
+            lock.unlock();
+            auto & worker = *workers[lane];
+            worker.pipeline_ticket = task.ticket;
+            worker.set_n_threads(task.n_threads, task.n_threads_batch);
+            worker.set_warmup(task.warmup);
+            const auto reused_before = worker.n_reused;
+            int ret = -3;
+            try {
+                ret = worker.decode(task.batch);
+            } catch (const std::exception & error) {
+                LLAMA_LOG_ERROR("%s: pipeline submission failed: %s\n", __func__, error.what());
+            }
+            if (ret != 0) {
+                std::lock_guard<std::mutex> prepare_lock(*owner.memory_mutex);
+                failed = true;
+                prepare_cv.notify_all();
+            }
+            lock.lock();
+            ++submitted;
+            work_cv.notify_all();
+            lock.unlock();
+            try {
+                worker.synchronize();
+                if (ret == 0) {
+                    for (size_t j = 0; j < task.output_rows.size(); ++j) {
+                        if (task.output_rows[j] < 0) { continue; }
+                        const auto * src = worker.get_logits_ith(j);
+                        if (!src) { throw std::runtime_error("pipeline output row is missing"); }
+                        const auto n_vocab = owner.model.vocab.n_tokens();
+                        std::memcpy(owner.logits.data + int64_t(task.output_rows[j])*n_vocab, src, n_vocab*sizeof(float));
+                    }
+                }
+            } catch (const std::exception & error) {
+                std::lock_guard<std::mutex> prepare_lock(*owner.memory_mutex);
+                failed = true;
+                prepare_cv.notify_all();
+                LLAMA_LOG_ERROR("%s: pipeline completion failed: %s\n", __func__, error.what());
+            }
+            lock.lock();
+            reused += worker.n_reused - reused_before;
+            ++completed;
+            work_cv.notify_all();
+        }
+    }
+};
 
 //
 // llama_context
@@ -82,9 +229,15 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params) : llama_context(model, params, nullptr) {}
+
+llama_context::llama_context(
+        const llama_model & model,
+              llama_context_params params,
+              llama_context * source) :
     model(model),
-    cvec(std::make_unique<llama_adapter_cvec>()),
+    params_init(params),
+    cvec(source ? source->cvec : std::make_shared<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
@@ -392,7 +545,13 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        if (source) {
+            memory = source->memory;
+            memory_mutex = source->memory_mutex;
+            if (source->pipeline && source->pipeline->workspace) { pipeline_lane = source->pipeline.get(); }
+        } else {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
     }
 
     // init backends
@@ -493,7 +652,21 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        sched_reserve();
+        if (!source && !hparams.no_alloc) {
+            const char * workers = std::getenv("LLAMA_PIPELINE_WORKERS");
+            if (workers && std::atoi(workers) > 1 && model.arch == LLM_ARCH_QWEN35 && cparams.kv_unified &&
+                    cparams.n_rs_seq == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sampling.samplers.empty()) {
+                const char * ubatch = std::getenv("LLAMA_PIPELINE_UBATCH");
+                set_pipeline(std::atoi(workers), ubatch ? std::atoi(ubatch) : cparams.n_ubatch);
+            } else {
+                if (workers && std::atoi(workers) > 1) {
+                    LLAMA_LOG_WARN("%s: CPU pipeline workers disabled: requires dense Qwen3.5, unified KV, default inference, no backend sampling and n_rs_seq=0\n", __func__);
+                }
+                sched_reserve();
+            }
+        } else {
+            sched_reserve();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -513,9 +686,192 @@ llama_context::llama_context(
     }
 }
 
+std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, uint32_t n_ubatch) {
+    if (model.arch != LLM_ARCH_QWEN35 || !cparams.kv_unified || !memory ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !sampling.samplers.empty() || !loras->empty() || opt_ctx) {
+        throw std::runtime_error("shared execution currently requires a dense Qwen3.5 unified KV context without backend sampling, LoRA, or training");
+    }
+    if (n_batch == 0 || n_ubatch == 0 || n_ubatch > n_batch) {
+        throw std::invalid_argument("invalid shared context batch sizes");
+    }
+    synchronize();
+    std::lock_guard<std::mutex> lock(*memory_mutex);
+    auto params = params_init;
+    params.n_ctx = cparams.n_ctx;
+    params.n_seq_max = cparams.n_seq_max;
+    params.n_batch = n_batch;
+    params.n_ubatch = n_ubatch;
+    params.samplers = nullptr;
+    params.n_samplers = 0;
+    return std::unique_ptr<llama_context>(new llama_context(model, params, this));
+}
+
+void llama_context::set_pipeline(uint32_t n_workers, uint32_t n_ubatch) {
+    synchronize();
+    const bool was_pooled = pipeline && pipeline->workspace;
+    if (pipeline && memory) { memory->on_synchronize = {}; }
+    pipeline.reset();
+    if (was_pooled) {
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+    if (n_workers < 2) { return; }
+    if (n_workers > 8 || n_ubatch == 0 || n_ubatch > cparams.n_batch || cparams.n_rs_seq != 0) {
+        throw std::invalid_argument("pipeline requires 2..8 workers, a valid ubatch, and n_rs_seq=0");
+    }
+    if (model.n_devices() < 2 || model.n_gpu_layers() <= model.hparams.n_layer_all ||
+            model.split_mode() != LLAMA_SPLIT_MODE_LAYER || !cparams.offload_kqv || model.has_tensor_overrides()) {
+        throw std::runtime_error("pipeline workers require full layer offload on multiple devices");
+    }
+    pipeline = std::make_unique<llama_context_pipeline>(*this);
+    try {
+        pipeline->workspace.reset(ggml_backend_workspace_pool_new());
+        sched_need_reserve = true;
+        sched_reserve();
+        for (uint32_t i = 0; i < n_workers; ++i) {
+            pipeline->workers.push_back(create_shared(n_ubatch, n_ubatch));
+            pipeline->workers.back()->pipeline_lane = pipeline.get();
+        }
+        pipeline->jobs.resize(n_workers);
+        for (uint32_t i = 0; i < n_workers; ++i) {
+            pipeline->threads.emplace_back([ptr = pipeline.get(), i] { ptr->run(i); });
+        }
+    } catch (...) {
+        pipeline.reset();
+        sched_need_reserve = true;
+        throw;
+    }
+    memory->on_synchronize = [this] { synchronize(); };
+    LLAMA_LOG_INFO("%s: pipeline workers enabled: %u CPU threads, ubatch %u, shared weights, KV and scratch\n", __func__, n_workers, n_ubatch);
+    LLAMA_LOG_INFO("%s: continuous submission enabled: logical batches wait for CPU submission, outputs and state access drain GPU work\n", __func__);
+    ggml_backend_workspace_pool_print(pipeline->workspace.get());
+}
+
+uint32_t llama_context::pipeline_n_workers() const {
+    if (!pipeline || opt_ctx || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+            cparams.cb_eval || abort_callback || !sampling.samplers.empty() || !loras->empty() ||
+            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool v) { return v; })) {
+        return 0;
+    }
+    return pipeline->workers.size();
+}
+
+uint32_t llama_context::pipeline_n_ubatch() const {
+    return pipeline ? pipeline->workers.front()->n_ubatch() : cparams.n_ubatch;
+}
+
+uint32_t llama_pipeline_n_ubatch(const llama_context * ctx) {
+    return ctx->pipeline_n_ubatch();
+}
+
+int32_t llama_context::pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data) {
+    if (pipeline_n_workers() == 0 || max_steps == 0 || !callback) { return -1; }
+    auto & pool = *pipeline;
+    synchronize();
+    memory_update(false);
+    synchronize();
+    uint64_t reused_before = 0;
+    for (auto & worker : pool.workers) {
+        worker->set_n_threads(cparams.n_threads, cparams.n_threads_batch);
+        worker->set_warmup(cparams.warmup);
+        reused_before += worker->n_reused;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pool.work_mutex);
+        pool.stream_jobs.assign(pool.workers.size(), {});
+        pool.failed = false;
+        pool.next_ticket = 0;
+        pool.streaming = true;
+    }
+    auto finish = [&] {
+        {
+            std::unique_lock<std::mutex> lock(pool.work_mutex);
+            pool.work_cv.wait(lock, [&] {
+                return std::none_of(pool.stream_jobs.begin(), pool.stream_jobs.end(), [](const auto & job) { return job.busy; });
+            });
+            pool.streaming = false;
+            pool.next_ticket = pool.issued;
+        }
+        ggml_backend_pipeline_reset(pool.backend);
+        uint64_t reused_after = 0;
+        for (const auto & worker : pool.workers) { reused_after += worker->n_reused; }
+        n_reused += reused_after - reused_before;
+    };
+    std::map<llama_seq_id, uint32_t> sequences;
+    size_t ticket = 0;
+    auto submit = [&](uint32_t lane, const llama_batch & batch) {
+        if (!batch.token || batch.embd || batch.n_tokens <= 0 || batch.n_tokens > int32_t(pool.workers[lane]->n_ubatch())) {
+            throw std::invalid_argument("pipeline stream requires a token decode batch within the worker ubatch");
+        }
+        std::set<llama_seq_id> ids;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.n_seq_id || batch.n_seq_id[i] != 1 || !batch.seq_id || !batch.seq_id[i] ||
+                    !batch.logits || !batch.logits[i] || !ids.insert(batch.seq_id[i][0]).second) {
+                throw std::invalid_argument("pipeline stream requires one output token per independent sequence");
+            }
+            auto entry = sequences.emplace(batch.seq_id[i][0], lane);
+            if (!entry.second && entry.first->second != lane) {
+                throw std::invalid_argument("pipeline stream sequence belongs to another lane");
+            }
+        }
+        std::lock_guard<std::mutex> lock(pool.work_mutex);
+        auto & job = pool.stream_jobs[lane];
+        GGML_ASSERT(!job.busy);
+        job.batch = batch;
+        job.ticket = ticket++;
+        job.pending = job.busy = true;
+        job.done = false;
+        pool.work_cv.notify_all();
+    };
+    int32_t result = 0;
+    try {
+        std::vector<uint32_t> steps(pool.workers.size(), 0);
+        for (uint32_t lane = 0; lane < pool.workers.size(); ++lane) {
+            llama_batch next{};
+            if (callback(data, lane, pool.workers[lane].get(), false, &next)) { submit(lane, next); }
+        }
+        while (true) {
+            uint32_t lane;
+            {
+                std::unique_lock<std::mutex> lock(pool.work_mutex);
+                pool.work_cv.wait(lock, [&] {
+                    return std::any_of(pool.stream_jobs.begin(), pool.stream_jobs.end(), [](const auto & job) { return job.done; }) ||
+                        std::none_of(pool.stream_jobs.begin(), pool.stream_jobs.end(), [](const auto & job) { return job.busy; });
+                });
+                auto done = std::find_if(pool.stream_jobs.begin(), pool.stream_jobs.end(), [](const auto & job) { return job.done; });
+                if (done == pool.stream_jobs.end()) { break; }
+                lane = done - pool.stream_jobs.begin();
+                done->done = false;
+                if (done->result != 0) { result = -3; break; }
+            }
+            llama_batch next{};
+            auto * next_ptr = ++steps[lane] < max_steps ? &next : nullptr;
+            if (callback(data, lane, pool.workers[lane].get(), true, next_ptr)) {
+                if (!next_ptr) { throw std::invalid_argument("pipeline callback submitted after the step limit"); }
+                submit(lane, next);
+            }
+        }
+    } catch (...) {
+        finish();
+        throw;
+    }
+    finish();
+    return result;
+}
+
+uint32_t llama_pipeline_n_workers(const llama_context * ctx) {
+    return ctx->pipeline_n_workers();
+}
+
+int32_t llama_pipeline_stream(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, void * data) {
+    return ctx->pipeline_stream(max_steps, callback, data);
+}
+
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (pipeline && memory) { memory->on_synchronize = {}; }
+    pipeline.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -637,7 +993,9 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto * workspace = pipeline_lane ? pipeline_lane->workspace.get() : pipeline ? pipeline->workspace.get() : nullptr;
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, !workspace && cparams.pipeline_parallel, cparams.op_offload));
+    if (workspace) { ggml_backend_sched_set_workspace_pool(sched.get(), workspace); }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -673,6 +1031,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (workspace) { ggml_backend_sched_set_workspace_pool(sched.get(), workspace); }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -724,9 +1083,15 @@ void llama_context::sched_reserve() {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buft_name(buft),
-                    backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            if (workspace) {
+                const size_t private_size = ggml_backend_sched_get_private_buffer_size(sched.get(), backend);
+                LLAMA_LOG_INFO("%s: %10s compute buffers: private = %8.2f MiB, shared = %8.2f MiB\n", __func__,
+                        ggml_backend_buft_name(buft), private_size / 1024.0 / 1024.0, (backend_buf_exp_size[i] - private_size) / 1024.0 / 1024.0);
+            } else {
+                LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                        ggml_backend_buft_name(buft),
+                        backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            }
         }
     }
 
@@ -749,6 +1114,7 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    if (pipeline) { pipeline->drain(); }
     if (!sched) {
         return;
     }
@@ -851,6 +1217,7 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        if (pipeline) { synchronize(); }
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -1316,6 +1683,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         return;
     }
 
+    if (pipeline) { synchronize(); }
     loras.reset(new llama_adapter_loras());
 
     for (size_t i = 0; i < n_adapters; i ++) {
@@ -1361,14 +1729,18 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+    if (pipeline) { synchronize(); }
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
     sched_need_reserve = true;
+    if (pipeline) {
+        for (auto & worker : pipeline->workers) { worker->sched_need_reserve = true; }
+    }
 
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1428,8 +1800,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    ret = GGML_STATUS_SUCCESS;
+    return res;
+}
+
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    auto * res = prepare_ubatch(ubatch, gtype, mctx, ret);
+    if (!res) {
+        return nullptr;
+    }
+    if (pipeline_lane) {
+        GGML_ASSERT(pipeline_lock && pipeline_lock->owns_lock());
+        ggml_backend_sched_prepare_pipeline(sched.get(), pipeline_lane->backend);
+        if (pipeline_lane->next_ticket == pipeline_ticket) {
+            ++pipeline_lane->next_ticket;
+            pipeline_lane->prepare_cv.notify_all();
+        }
+        pipeline_lock->unlock();
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (pipeline_lock && !pipeline_lock->owns_lock()) { pipeline_lock->lock(); }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
@@ -1441,6 +1832,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (pipeline) { synchronize(); }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1679,6 +2071,160 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (pipeline_lane) {
+        std::unique_lock<std::mutex> lock(*memory_mutex);
+        pipeline_lane->prepare_cv.wait(lock, [&] { return pipeline_lane->failed || pipeline_lane->next_ticket == pipeline_ticket; });
+        if (pipeline_lane->failed) { return -3; }
+        pipeline_lock = &lock;
+        try {
+            const int ret = decode_impl(batch_inp);
+            if (ret != 0) {
+                if (!lock.owns_lock()) { lock.lock(); }
+                pipeline_lane->failed = true;
+                pipeline_lane->prepare_cv.notify_all();
+            }
+            pipeline_lock = nullptr;
+            return ret;
+        } catch (...) {
+            ggml_backend_sched_cancel_pipeline(sched.get());
+            synchronize();
+            if (!lock.owns_lock()) { lock.lock(); }
+            pipeline_lane->failed = true;
+            pipeline_lane->prepare_cv.notify_all();
+            pipeline_lock = nullptr;
+            throw;
+        }
+    }
+    if (pipeline_n_workers() > 0 && batch_inp.n_tokens > 1) {
+        bool independent = true;
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) { independent &= !batch_inp.n_seq_id || batch_inp.n_seq_id[i] == 1; }
+        if (independent) { return decode_pipeline(batch_inp); }
+    }
+    if (pipeline) { synchronize(); }
+    if (memory.use_count() <= 1) {
+        return decode_impl(batch_inp);
+    }
+    // Other shared executors must finish before memory metadata can change.
+    std::lock_guard<std::mutex> lock(*memory_mutex);
+    try {
+        const int ret = decode_impl(batch_inp);
+        synchronize();
+        return ret;
+    } catch (...) {
+        synchronize();
+        throw;
+    }
+}
+
+int llama_context::decode_pipeline(const llama_batch & batch_inp) {
+    auto & pool = *pipeline;
+    if (pool.failed) {
+        synchronize();
+        pool.failed = false;
+        pool.next_ticket = pool.issued;
+        return -3;
+    }
+    // Previous output copies must finish before their destination can be reused.
+    if (n_outputs > 0) { synchronize(); }
+    if (memory_update(false)) { synchronize(); }
+    const uint32_t n_embd = model.hparams.n_embd_inp();
+    if (!balloc->init(batch_inp, model.vocab, memory.get(), n_embd, LLAMA_MAX_SEQ, false)) { return -1; }
+    const auto & batch = balloc->get_batch();
+    if (batch.n_tokens > int32_t(cparams.n_batch)) { return -1; }
+    const uint32_t total_outputs = balloc->get_n_outputs();
+    if (output_reserve(total_outputs) < total_outputs) { return -2; }
+    output_swaps.clear();
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    int32_t row = 0;
+    std::map<llama_seq_id, std::vector<int32_t>> sequences;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        sequences[batch.seq_id[i][0]].push_back(i);
+        if (batch.logits[i]) { output_ids[i] = row++; }
+    }
+    std::vector<llama_context_pipeline::job> jobs;
+    const size_t chunk = pool.workers[0]->cparams.n_ubatch;
+    const size_t n_pos = batch.token ? 1 : model.hparams.n_pos_per_embd();
+    std::vector<std::vector<int32_t>> partitions;
+    if (sequences.size() == size_t(batch.n_tokens)) {
+        const size_t width = std::min(chunk, (sequences.size() + pool.workers.size() - 1)/pool.workers.size());
+        for (int32_t i = 0; i < batch.n_tokens;) {
+            std::vector<int32_t> indices;
+            for (size_t j = 0; j < width && i < batch.n_tokens; ++j) { indices.push_back(i++); }
+            partitions.push_back(std::move(indices));
+        }
+    } else {
+        for (size_t start = 0;; start += chunk) {
+            bool more = false;
+            for (const auto & entry : sequences) {
+                if (start >= entry.second.size()) { continue; }
+                more = true;
+                const size_t count = std::min(chunk, entry.second.size() - start);
+                partitions.emplace_back(entry.second.begin() + start, entry.second.begin() + start + count);
+            }
+            if (!more) { break; }
+        }
+    }
+    for (const auto & indices : partitions) {
+        const size_t count = indices.size();
+        llama_context_pipeline::job task;
+        if (batch.token) { task.tokens.resize(count); }
+        if (batch.embd) { task.embeddings.resize(count*n_embd); }
+        task.positions.resize(count*n_pos);
+        task.counts.assign(count, 1);
+        task.sequences.resize(count);
+        task.sequence_ptrs.resize(count);
+        task.outputs.resize(count);
+        task.output_rows.resize(count);
+        for (size_t j = 0; j < count; ++j) {
+            const int32_t index = indices[j];
+            if (batch.token) { task.tokens[j] = batch.token[index]; }
+            if (batch.embd) { std::memcpy(task.embeddings.data() + j*n_embd, batch.embd + int64_t(index)*n_embd, n_embd*sizeof(float)); }
+            for (size_t k = 0; k < n_pos; ++k) { task.positions[k*count + j] = batch.pos[k*batch.n_tokens + index]; }
+            task.sequences[j] = batch.seq_id[index][0];
+            task.sequence_ptrs[j] = &task.sequences[j];
+            task.outputs[j] = batch.logits[index];
+            task.output_rows[j] = output_ids[index];
+        }
+        task.batch = {int32_t(count), task.tokens.empty() ? nullptr : task.tokens.data(),
+            task.embeddings.empty() ? nullptr : task.embeddings.data(), task.positions.data(),
+            task.counts.data(), task.sequence_ptrs.data(), task.outputs.data()};
+        task.n_threads = cparams.n_threads;
+        task.n_threads_batch = cparams.n_threads_batch;
+        task.warmup = cparams.warmup;
+        jobs.push_back(std::move(task));
+    }
+    if (t_compute_start_us == 0) { t_compute_start_us = ggml_time_us(); }
+    n_queued_tokens += batch.n_tokens;
+    n_outputs = total_outputs;
+    {
+        std::unique_lock<std::mutex> lock(pool.work_mutex);
+        try {
+            for (auto & task : jobs) {
+                task.ticket = pool.issued;
+                pool.jobs[pool.issued % pool.workers.size()].push_back(std::move(task));
+                ++pool.issued;
+            }
+        } catch (...) {
+            pool.work_cv.notify_all();
+            lock.unlock();
+            synchronize();
+            throw;
+        }
+        pool.work_cv.notify_all();
+        // No worker can still mutate KV metadata when the caller regains control.
+        pool.work_cv.wait(lock, [&] { return pool.submitted == pool.issued; });
+    }
+    // Partial completion cannot be retried as the same batch on recurrent models.
+    if (pool.failed) {
+        synchronize();
+        pool.failed = false;
+        pool.next_ticket = pool.issued;
+        return -3;
+    }
+    return 0;
+}
+
+int llama_context::decode_impl(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1779,7 +2325,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (!pipeline_lane) { memory_update(false); }
 
     llama_memory_context_ptr mctx;
 
@@ -1801,7 +2347,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize) {
+                    if (!did_optimize && !pipeline_lane) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -2015,6 +2561,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        if (pipeline_lock && !pipeline_lock->owns_lock()) { pipeline_lock->lock(); }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3413,7 +3960,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ret[buft].compute += ggml_backend_sched_get_private_buffer_size(sched.get(), backend);
+            if (pipeline && pipeline->workspace) {
+                ret[buft].compute += ggml_backend_workspace_pool_get_buffer_size(pipeline->workspace.get(), buft);
+            }
+        }
+    }
+    if (pipeline) {
+        for (const auto & worker : pipeline->workers) {
+            for (const auto & [buft, usage] : worker->memory_breakdown()) { ret[buft].compute += usage.compute; }
         }
     }
     return ret;
@@ -4059,6 +4614,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    if (mem->on_synchronize) { mem->on_synchronize(); }
     mem->clear(data);
 }
 
@@ -4071,6 +4627,9 @@ bool llama_memory_seq_rm(
         return true;
     }
 
+    if (mem->on_synchronize && (seq_id < 0 || p0 < 0 || p0 <= mem->seq_pos_max(seq_id))) {
+        mem->on_synchronize();
+    }
     return mem->seq_rm(seq_id, p0, p1);
 }
 
@@ -4084,6 +4643,7 @@ void llama_memory_seq_cp(
         return;
     }
 
+    if (mem->on_synchronize) { mem->on_synchronize(); }
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -4094,6 +4654,7 @@ void llama_memory_seq_keep(
         return;
     }
 
+    if (mem->on_synchronize) { mem->on_synchronize(); }
     mem->seq_keep(seq_id);
 }
 
@@ -4107,6 +4668,7 @@ void llama_memory_seq_add(
         return;
     }
 
+    if (mem->on_synchronize) { mem->on_synchronize(); }
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -4120,6 +4682,7 @@ void llama_memory_seq_div(
         return;
     }
 
+    if (mem->on_synchronize) { mem->on_synchronize(); }
     mem->seq_div(seq_id, p0, p1, d);
 }
 

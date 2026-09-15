@@ -335,6 +335,20 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### CPU pipeline workers (experimental)
+
+For dense Qwen3.5-family models (`qwen35`, including Qwen3.6-27B) split by layer across multiple GPUs, `LLAMA_PIPELINE_WORKERS=2` enables separate CPU execution threads with shared weights, unified KV, and a shared GPU workspace pool. Prefill microbatches can overlap on different GPUs. During decode, the server assigns independent requests to worker lanes and batches extra requests within each lane.
+
+```sh
+LLAMA_PIPELINE_WORKERS=2 ./llama-server -m model.gguf -ngl 99 -dev CUDA0,CUDA1 -fa on -kvu -np 4 -b 2048 -ub 512
+```
+
+The initial scope is dense `qwen35` models; Qwen4Exp and MoE models use the ordinary scheduler. The worker count must be between 2 and 8. The model must use full layer offload, KQV offload, unified KV, and no tensor placement overrides. CUDA, ROCm, and Vulkan device workspaces can be pooled; host buffers and unsupported buffer types remain private. Startup prints `pipeline workers enabled`, the CPU thread count, the worker ubatch size, and the shared pool allocation.
+
+`-ub` sets the main context's physical batch limit and the default worker limit. `LLAMA_PIPELINE_UBATCH` can override the worker limit, up to `-b`. Each context retains its own graph and output buffers, while the pool reuses device scratch between GPU stages. More workers can increase host memory and private buffer usage. Throughput depends on stage balance, microbatch size, and the number of active requests.
+
+Single-token decode and operations requiring embeddings, backend sampling, LoRA, evaluation/abort callbacks, or noncausal attention use the main context after draining worker work. Speculative decode does not use independent server lanes. Recurrent rollback (`n_rs_seq > 0`) is not supported by the worker path. `LLAMA_PIPELINE_STREAM=0` disables independent server decode lanes while keeping worker prefill enabled. Unset `LLAMA_PIPELINE_WORKERS` to use the ordinary scheduler.
+
 ### Multimodal support
 
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.
