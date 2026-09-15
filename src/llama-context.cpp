@@ -654,13 +654,13 @@ llama_context::llama_context(
 
         if (!source && !hparams.no_alloc) {
             const char * workers = std::getenv("LLAMA_PIPELINE_WORKERS");
-            if (workers && std::atoi(workers) > 1 && model.arch == LLM_ARCH_QWEN35 && cparams.kv_unified &&
+            if (workers && std::atoi(workers) > 1 && (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && cparams.kv_unified &&
                     cparams.n_rs_seq == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sampling.samplers.empty()) {
                 const char * ubatch = std::getenv("LLAMA_PIPELINE_UBATCH");
                 set_pipeline(std::atoi(workers), ubatch ? std::atoi(ubatch) : cparams.n_ubatch);
             } else {
                 if (workers && std::atoi(workers) > 1) {
-                    LLAMA_LOG_WARN("%s: CPU pipeline workers disabled: requires dense Qwen3.5, unified KV, default inference, no backend sampling and n_rs_seq=0\n", __func__);
+                    LLAMA_LOG_WARN("%s: CPU pipeline workers disabled: requires Qwen3.5 or Qwen4Exp, unified KV, default inference, no backend sampling and n_rs_seq=0\n", __func__);
                 }
                 sched_reserve();
             }
@@ -687,9 +687,9 @@ llama_context::llama_context(
 }
 
 std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, uint32_t n_ubatch) {
-    if (model.arch != LLM_ARCH_QWEN35 || !cparams.kv_unified || !memory ||
+    if ((model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN4EXP) || !cparams.kv_unified || !memory ||
             cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !sampling.samplers.empty() || !loras->empty() || opt_ctx) {
-        throw std::runtime_error("shared execution currently requires a dense Qwen3.5 unified KV context without backend sampling, LoRA, or training");
+        throw std::runtime_error("shared execution currently requires a Qwen3.5 or Qwen4Exp unified KV context without backend sampling, LoRA, or training");
     }
     if (n_batch == 0 || n_ubatch == 0 || n_ubatch > n_batch) {
         throw std::invalid_argument("invalid shared context batch sizes");

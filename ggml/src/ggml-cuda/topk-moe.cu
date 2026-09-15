@@ -38,9 +38,13 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         if (active) {
             const float val = expf(vals[i] - max_val);
             vals[i]         = val;
-            sum += val;
         } else {
             vals[i] = 0.f;
+        }
+        // Match SOFT_MAX: reduce contiguous groups before reducing their sums.
+        const float partial = warp_reduce_sum(vals[i]);
+        if (lane == i) {
+            sum = partial;
         }
     }
 
@@ -54,6 +58,45 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         const bool active = !use_limit || (idx < limit);
         if (active) {
             vals[i] *= inv_sum;
+        }
+    }
+}
+
+// Keep the rare sort out of the selector's register budget.
+// Match the strict compare-exchange order of the bitonic ARGSORT kernel.
+template <int n_experts, int count>
+static __device__ __noinline__ void topk_moe_sort_ties(float (&values)[count], int (&indices)[count]) {
+#pragma unroll
+    for (int i = 0; i < count; ++i) {
+        indices[i] = threadIdx.x + i*WARP_SIZE;
+    }
+#pragma unroll
+    for (int k = 2; k <= n_experts; k *= 2) {
+#pragma unroll
+        for (int j = k/2; j > 0; j /= 2) {
+#pragma unroll
+            for (int i = 0; i < count; ++i) {
+                const int col = threadIdx.x + i*WARP_SIZE;
+                if (j >= WARP_SIZE) {
+                    const int other = i ^ (j/WARP_SIZE);
+                    if (i < other && ((col & k) == 0 ? values[i] < values[other] : values[i] > values[other])) {
+                        const float value = values[i];
+                        const int index = indices[i];
+                        values[i] = values[other];
+                        indices[i] = indices[other];
+                        values[other] = value;
+                        indices[other] = index;
+                    }
+                } else {
+                    const float value = __shfl_xor_sync(0xFFFFFFFF, values[i], j, WARP_SIZE);
+                    const int index = __shfl_xor_sync(0xFFFFFFFF, indices[i], j, WARP_SIZE);
+                    const bool descending = ((col & k) == 0) == ((col & j) == 0);
+                    if (descending ? values[i] < value : values[i] > value) {
+                        values[i] = value;
+                        indices[i] = index;
+                    }
+                }
+            }
         }
     }
 }
@@ -172,11 +215,15 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     float wt_sum = 0.f;
 
+    constexpr bool check_ties = !has_bias && (n_experts & (n_experts - 1)) == 0;
+    bool has_ties = false;
+    int output_indices[experts_per_thread];
     float output_weights[experts_per_thread];
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         output_weights[i] = 0.f;
+        output_indices[i] = -1;
     }
 
     ggml_cuda_pdl_lc();
@@ -232,19 +279,46 @@ __global__ void topk_moe_cuda(const float *         logits,
                 }
             }
 
+            if constexpr (check_ties) {
+                int equal = 0;
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; ++i) {
+                    equal += wt[i] == max_val;
+                }
+                has_ties |= warp_reduce_sum(equal) > 1;
+            }
+
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
                 wt[max_expert / WARP_SIZE] = -INFINITY;
             }
         }
 
+        // Keep the reduction indexed by top-k rank.
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
             output_weights[k / WARP_SIZE] = max_val;
-        }
-
-        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
+            output_indices[k / WARP_SIZE] = max_expert;
             if (config.with_norm) {
                 wt_sum += max_val;
+            }
+        }
+    }
+
+    if constexpr (check_ties) {
+        if (has_ties) {
+            // Restore the selected entries before sorting the original scores.
+            for (int k = 0; k < n_expert_used; ++k) {
+                const int expert = __shfl_sync(0xFFFFFFFF, output_indices[k/WARP_SIZE], k % WARP_SIZE, WARP_SIZE);
+                const float value = __shfl_sync(0xFFFFFFFF, output_weights[k/WARP_SIZE], k % WARP_SIZE, WARP_SIZE);
+                if ((expert & (WARP_SIZE - 1)) == threadIdx.x) {
+                    wt[expert/WARP_SIZE] = value;
+                }
+            }
+            topk_moe_sort_ties<n_experts>(wt, output_indices);
+            wt_sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; ++i) {
+                output_weights[i] = threadIdx.x + i*WARP_SIZE < n_expert_used ? wt[i] : 0.0f;
+                wt_sum += output_weights[i];
             }
         }
     }
@@ -252,10 +326,9 @@ __global__ void topk_moe_cuda(const float *         logits,
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
-        const float inv_sum = 1.0f / wt_sum;
 
         for (int i = 0; i < experts_per_thread; i++) {
-            output_weights[i] *= inv_sum;
+            output_weights[i] /= wt_sum;
         }
     }
 
@@ -268,6 +341,7 @@ __global__ void topk_moe_cuda(const float *         logits,
         const int idx = i * WARP_SIZE + threadIdx.x;
         if (idx < n_expert_used) {
             weights[idx] = output_weights[i] * scale_val;
+            ids[idx] = output_indices[i];
         }
     }
 }

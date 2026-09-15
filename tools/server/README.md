@@ -337,13 +337,13 @@ services:
 
 ### CPU pipeline workers (experimental)
 
-For dense Qwen3.5-family models (`qwen35`, including Qwen3.6-27B) split by layer across multiple GPUs, `LLAMA_PIPELINE_WORKERS=2` enables separate CPU execution threads with shared weights, unified KV, and a shared GPU workspace pool. Prefill microbatches can overlap on different GPUs. During decode, the server assigns independent requests to worker lanes and batches extra requests within each lane.
+For dense Qwen3.5-family models (`qwen35`, including Qwen3.6-27B) and Qwen4Exp models split by layer across multiple GPUs, `LLAMA_PIPELINE_WORKERS=2` enables separate CPU execution threads with shared weights, unified KV, and a shared GPU workspace pool. Prefill microbatches can overlap on different GPUs. During decode, the server assigns independent requests to worker lanes and batches extra requests within each lane.
 
 ```sh
 LLAMA_PIPELINE_WORKERS=2 ./llama-server -m model.gguf -ngl 99 -dev CUDA0,CUDA1 -fa on -kvu -np 4 -b 2048 -ub 512
 ```
 
-The initial scope is dense `qwen35` models; Qwen4Exp and MoE models use the ordinary scheduler. The worker count must be between 2 and 8. The model must use full layer offload, KQV offload, unified KV, and no tensor placement overrides. CUDA, ROCm, and Vulkan device workspaces can be pooled; host buffers and unsupported buffer types remain private. Startup prints `pipeline workers enabled`, the CPU thread count, the worker ubatch size, and the shared pool allocation.
+The supported architectures are `qwen35` and `qwen4exp`. For Qwen4Exp, enable native QSA with `LLAMA_QSA_NATIVE=1` to avoid the dense indexer workspace. The worker count must be between 2 and 8. The model must use full layer offload, KQV offload, unified KV, and no tensor placement overrides. CUDA, ROCm, and Vulkan device workspaces can be pooled; host buffers and unsupported buffer types remain private. Startup prints `pipeline workers enabled`, the CPU thread count, the worker ubatch size, and the shared pool allocation.
 
 `-ub` sets the main context's physical batch limit and the default worker limit. `LLAMA_PIPELINE_UBATCH` can override the worker limit, up to `-b`. Each context retains its own graph and output buffers, while the pool reuses device scratch between GPU stages. More workers can increase host memory and private buffer usage. Throughput depends on stage balance, microbatch size, and the number of active requests.
 
