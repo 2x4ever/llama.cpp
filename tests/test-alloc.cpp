@@ -650,6 +650,73 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+struct test_buffer_provider {
+    int calls = 0;
+    int released = 0;
+    int fail_at = -1;
+
+    static ggml_backend_buffer_t alloc(void * context, ggml_backend_buffer_type_t buft, int, int, size_t size) {
+        auto & provider = *static_cast<test_buffer_provider *>(context);
+        if (++provider.calls == provider.fail_at) { return nullptr; }
+        auto buffer = ggml_backend_buft_alloc_buffer(buft, size);
+        if (buffer) { ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE); }
+        return buffer;
+    }
+
+    static void release(void * context, ggml_backend_buffer_t buffer) {
+        ++static_cast<test_buffer_provider *>(context)->released;
+        ggml_backend_buffer_free(buffer);
+    }
+
+    ggml_gallocr_buffer_provider get() { return {this, alloc, release}; }
+};
+
+static void test_provider_buffer_ids() {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    auto input = make_input_with_size(ctx, 16);
+    auto first = ggml_scale(ctx, input, 2.0f);
+    auto second = ggml_scale(ctx, first, 2.0f);
+    auto output = ggml_scale(ctx, second, 2.0f);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    auto backend = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = {&backend.buffer_type, &backend.buffer_type};
+    test_buffer_provider provider;
+    ggml_gallocr_ptr alloc(ggml_gallocr_new_n_with_provider(bufts, 2, provider.get()));
+    const int nodes[] = {0, 1, 0};
+    const int leafs[] = {0};
+    GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, nodes, leafs));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph));
+    check_all_allocated(graph);
+    GGML_ASSERT(first->buffer == input->buffer && output->buffer == input->buffer);
+    GGML_ASSERT(second->buffer != first->buffer);
+    GGML_ASSERT(provider.calls == 2);
+    alloc.reset();
+    GGML_ASSERT(provider.released == 2 && backend.context->buffers.empty());
+}
+
+static void test_provider_allocation_failure() {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    auto input = make_input_with_size(ctx, 32);
+    auto other = make_input_with_size(ctx, 32);
+    auto output = ggml_add(ctx, input, other);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    auto backend = dummy_backend_init(32);
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    test_buffer_provider provider;
+    provider.fail_at = 2;
+    ggml_gallocr_ptr alloc(ggml_gallocr_new_n_with_provider(&buft, 1, provider.get()));
+    GGML_ASSERT(!ggml_gallocr_reserve(alloc.get(), graph));
+    GGML_ASSERT(provider.calls == 2 && provider.released == 1 && backend.context->buffers.empty());
+    GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph));
+    check_all_allocated(graph);
+    check_max_size(ctx);
+    alloc.reset();
+    GGML_ASSERT(provider.released == provider.calls - 1 && backend.context->buffers.empty());
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -672,5 +739,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_provider_buffer_ids", test_provider_buffer_ids);
+    run("test_provider_allocation_failure", test_provider_allocation_failure);
     return 0;
 }
