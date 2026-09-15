@@ -2481,7 +2481,7 @@ extern "C" {
             struct ggml_tensor * tail,
             int k);
 
-    // I32 [selected, queries, 1, streams]; -1 pads, other values must index K/V.
+    // I32 [selected, queries, 1, streams]; -1 pads, other values must index K/V and be unique per row.
     GGML_API void ggml_flash_attn_ext_set_indices(
             struct ggml_tensor * a,
             struct ggml_tensor * indices);
