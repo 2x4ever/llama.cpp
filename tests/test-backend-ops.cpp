@@ -11017,6 +11017,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t rows : {1, 64, 512}) {
+        test_cases.emplace_back(new test_topk_moe({512, rows, 1, 1}, 10, true));
+    }
+
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));

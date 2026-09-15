@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1994,7 +1995,7 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = get_token_probabilities(slot.ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2791,6 +2792,81 @@ private:
     };
 #endif
 
+    bool try_pipeline_decode() {
+        const char * enabled = std::getenv("LLAMA_PIPELINE_STREAM");
+        const uint32_t n_workers = llama_pipeline_n_workers(ctx_tgt);
+        if (n_workers < 2 || spec || (enabled && std::atoi(enabled) == 0)) { return false; }
+        std::vector<server_slot *> active;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) { continue; }
+            if (slot.state != SLOT_STATE_GENERATING || slot.need_embd() || !slot.inp_embd.empty() || !slot.lora.empty() ||
+                    slot.task->is_parent() || slot.task->is_child() || slot.prompt.n_tokens() + 64 >= slot.n_ctx) {
+                return false;
+            }
+            active.push_back(&slot);
+        }
+        if (active.size() < 2) { return false; }
+        struct lane_state {
+            server_batch batch;
+            std::vector<server_slot *> slots;
+        };
+        struct stream_state {
+            server_context_impl * server;
+            std::vector<std::unique_ptr<lane_state>> lanes;
+            bool draining = false;
+        } state{this, {}};
+        const size_t width = (active.size() + n_workers - 1)/n_workers;
+        if (width > llama_pipeline_n_ubatch(ctx_tgt)) { return false; }
+        for (uint32_t lane = 0; lane < n_workers; ++lane) {
+            auto item = std::make_unique<lane_state>();
+            item->batch.init(width, 0);
+            const size_t first = lane*(active.size()/n_workers) + std::min<size_t>(lane, active.size()%n_workers);
+            const size_t count = active.size()/n_workers + (lane < active.size()%n_workers);
+            for (size_t i = first; i < first + count; ++i) { item->slots.push_back(active[i]); }
+            state.lanes.push_back(std::move(item));
+        }
+        SRV_DBG("pipeline decode: %zu requests on %u worker lanes\n", active.size(), n_workers);
+        auto restore_contexts = [&] {
+            for (auto * slot : active) { slot->ctx_tgt = ctx_tgt; }
+        };
+        try {
+            const int32_t ret = llama_pipeline_stream(ctx_tgt, 64,
+                [](void * data, uint32_t id, llama_context * worker, bool has_output, llama_batch * next) {
+                    auto & state = *(stream_state *) data;
+                    auto & lane = *state.lanes[id];
+                    auto & server = *state.server;
+                    if (has_output) {
+                        ++server.metrics.n_decode;
+                        for (size_t i = 0; i < lane.batch.tokens.size(); ++i) {
+                            auto & slot = server.slots[lane.batch.tokens[i].id_slot];
+                            server.metrics.n_tokens_max = std::max(server.metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+                            ++server.metrics.n_busy_slots;
+                            server.sample_token(slot, i);
+                        }
+                    }
+                    state.draining = state.draining || server.queue_tasks.has_pending_tasks();
+                    if (!next || state.draining) { return false; }
+                    lane.batch.clear();
+                    for (auto * slot : lane.slots) {
+                        if (slot->state != SLOT_STATE_GENERATING) { continue; }
+                        slot->ctx_tgt = worker;
+                        slot->handle_last_sampled_token(lane.batch);
+                    }
+                    if (lane.batch.size() == 0) { return false; }
+                    lane.batch.render();
+                    *next = lane.batch.get_view(0, lane.batch.size());
+                    return true;
+                }, &state);
+            restore_contexts();
+            if (ret != 0) { throw std::runtime_error("pipeline decode failed: " + std::to_string(ret)); }
+        } catch (...) {
+            restore_contexts();
+            for (auto * slot : active) { slot->prompt_clear(); }
+            throw;
+        }
+        return true;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2830,6 +2906,13 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+        }
+
+        try {
+            if (try_pipeline_decode()) { return; }
+        } catch (const std::exception & error) {
+            abort_all_slots("pipeline decode failed: " + std::string(error.what()));
+            return;
         }
 
         try {
@@ -3800,6 +3883,54 @@ private:
         return true;
     }
 
+    void sample_token(server_slot & slot, int32_t tok_idx) {
+        auto accept_special_token = [&](server_slot & current, llama_token token) {
+            return params_base.special || current.task->params.sampling.preserved_tokens.count(token) != 0;
+        };
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+        }
+
+        slot.i_batch = -1;
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+        }
+
+        if (!process_token(result, slot)) {
+            // release slot because of stop condition
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+
+            return;
+        }
+
+        slot.print_timings_tg();
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -3869,48 +4000,7 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
-
-            slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            sample_token(slot, tok_idx);
         });
 
         // speculative decoding - main model sample and accept
