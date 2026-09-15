@@ -600,6 +600,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_QSA_SELECT,
+        GGML_OP_QSA_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2459,6 +2461,30 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // scores [blocks, queries, streams], cells [ratio, blocks, streams].
+    // visible is a bitset per query; tail contains cell indices padded with -1.
+    GGML_API struct ggml_tensor * ggml_qsa_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor * scores,
+            struct ggml_tensor * cells,
+            struct ggml_tensor * visible,
+            struct ggml_tensor * tail,
+            int k);
+
+    GGML_API struct ggml_tensor * ggml_qsa_indexer(
+            struct ggml_context * ctx,
+            struct ggml_tensor * keys,
+            struct ggml_tensor * queries,
+            struct ggml_tensor * cells,
+            struct ggml_tensor * visible,
+            struct ggml_tensor * tail,
+            int k);
+
+    // I32 [selected, queries, 1, streams]; -1 pads, other values must index K/V.
+    GGML_API void ggml_flash_attn_ext_set_indices(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices);
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order

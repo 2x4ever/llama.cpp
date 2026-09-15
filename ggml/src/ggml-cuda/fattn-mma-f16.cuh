@@ -612,7 +612,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const int stride_mask, const int n_kv, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    if (stride_mask == 0) {
+    if (mask_h && stride_mask == 0) {
         const int4 * meta = (const int4 *) mask_h;
 #pragma unroll
         for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
@@ -671,7 +671,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 
                 if constexpr (use_sparse) {
                     const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                    tile_mask[j_sram*(nbatch_fa + 8) + i] = index >= 0 ? mask_h[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
+                    tile_mask[j_sram*(nbatch_fa + 8) + i] = index >= 0 ? (mask_h ? mask_h[int64_t(j_vram)*stride_mask + index] : half(0.0f)) : half(-INFINITY);
                 } else {
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = i < i_sup ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(0.0f);
                 }
@@ -760,7 +760,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = kv_quant ? 0 : ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
 
-    constexpr bool kv_prefetch = kv_quant && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV);
+    constexpr bool kv_prefetch = kv_quant && !use_sparse && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV);
 
     constexpr bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols);
     constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
@@ -1417,7 +1417,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = kv_quant ? 0 : ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
 
-    constexpr bool kv_prefetch = kv_quant && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV);
+    constexpr bool kv_prefetch = kv_quant && !use_sparse && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -2091,7 +2091,8 @@ static __global__ void flash_attn_ext_f16(
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
     if (use_sparse) {
-        KV_max = KV_max_ptr + int64_t(iter_j)*ne33*ne11;
+        // ne32 < 0 marks direct indexed input without appended live counts.
+        KV_max = ne32 < 0 ? nullptr : KV_max_ptr + int64_t(iter_j)*ne33*ne11;
     }
 
     // kbc == k block continuous, current index in continuous ijk space.
@@ -2117,7 +2118,7 @@ static __global__ void flash_attn_ext_f16(
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+        const half   * mask_h = !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
@@ -2127,9 +2128,9 @@ static __global__ void flash_attn_ext_f16(
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-        if (use_sparse) {
+        if (use_sparse && KV_max) {
             kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
-        } else if (KV_max) {
+        } else if (!use_sparse && KV_max) {
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -2166,7 +2167,7 @@ static __global__ void flash_attn_ext_f16(
 
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-    const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+    const half   * mask_h = !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
@@ -2176,9 +2177,9 @@ static __global__ void flash_attn_ext_f16(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-    if (use_sparse) {
+    if (use_sparse && KV_max) {
         kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
-    } else if (KV_max) {
+    } else if (!use_sparse && KV_max) {
         kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
     }
 
@@ -2238,7 +2239,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(ggml_backend_cuda_context
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
     const int  nstages        = kv_quant ? 0 : ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
 
-    const bool kv_prefetch = kv_quant && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV, cc);
+    const bool sparse_mask = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2) &&
+        dst->src[3] && dst->src[3]->type != GGML_TYPE_I32 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2);
+    const bool kv_prefetch = kv_quant && !dst->src[5] && !sparse_mask && ggml_cuda_fattn_mma_quant_prefetch(DKQ, DV, cc);
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -2277,7 +2280,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(ggml_backend_cuda_context
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
+            if (dst->src[5] || (dst->src[3] && dst->src[3]->type != GGML_TYPE_I32 &&
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2))) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, type_KV>;
                 use_sparse = true;
