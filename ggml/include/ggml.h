@@ -2464,6 +2464,7 @@ extern "C" {
 
     // scores [blocks, queries, streams], cells [ratio, blocks, streams].
     // visible is a bitset per query; tail contains cell indices padded with -1.
+    // Fill k*ratio + ratio - 1 tokens, including the tail and a partial boundary block if needed.
     GGML_API struct ggml_tensor * ggml_qsa_select(
             struct ggml_context * ctx,
             struct ggml_tensor * scores,
