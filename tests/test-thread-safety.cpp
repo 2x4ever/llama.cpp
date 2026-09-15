@@ -29,7 +29,7 @@ static double pipeline_difference(const std::vector<float> & a, const std::vecto
     }
     return d;
 }
-static int test_pipeline(int argc, char ** argv) {
+static int test_pipeline(int argc, char ** argv, bool mtp = false) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     common_init();
     common_params params;
@@ -51,7 +51,7 @@ static int test_pipeline(int argc, char ** argv) {
     cp.n_seq_max = seqs;
     cp.n_batch = std::max(1024, ubatch);
     cp.n_ubatch = ubatch;
-    cp.n_rs_seq = 0;
+    cp.n_rs_seq = mtp ? 3 : 0;
     cp.n_threads = cp.n_threads_batch = 4;
     cp.kv_unified = true;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -62,6 +62,99 @@ static int test_pipeline(int argc, char ** argv) {
     auto tokens = common_tokenize(llama_model_get_vocab(model), text, true, false);
     auto token = [&](int seq, int pos) { return tokens[(size_t(seq)*4096 + pos)%tokens.size()]; };
     auto batch = llama_batch_init(cp.n_batch, 0, 1);
+    if (mtp) {
+        const int n_embd = llama_model_n_embd_out(model);
+        const int length = ubatch + 2;
+        auto output = [&](int pos) { return pos % 19 == 0 || pos == length - 1; };
+        for (bool masked : { false, true }) {
+            std::vector<float> reference_h, reference_logits;
+            for (int mode = 0; mode < 4; ++mode) {
+                owner->set_pipeline(mode == 1 ? workers : 0, ubatch);
+                llama_set_embeddings_nextn(owner.get(), true, masked);
+                llama_memory_clear(llama_get_memory(owner.get()), true);
+                std::vector<float> h(size_t(length)*seqs*n_embd), logits(size_t(5)*seqs*vocab);
+                auto decode = [&] {
+                    pipeline_require(llama_decode(owner.get(), batch) == 0, "MTP prefill");
+                    for (int i = 0; i < batch.n_tokens; ++i) {
+                        const int seq = batch.seq_id[i][0], pos = batch.pos[i];
+                        if (!masked || batch.logits[i]) {
+                            const auto * row = llama_get_embeddings_nextn_ith(owner.get(), i);
+                            pipeline_require(row != nullptr, "MTP hidden row");
+                            std::copy(row, row + n_embd, h.data() + size_t(pos*seqs + seq)*n_embd);
+                        }
+                        if (batch.logits[i]) {
+                            const auto * row = llama_get_logits_ith(owner.get(), i);
+                            pipeline_require(row != nullptr, "MTP logits row");
+                            const int out = pos == length - 1 ? 4 : pos/19;
+                            std::copy(row, row + vocab, logits.data() + size_t(out*seqs + seq)*vocab);
+                        }
+                    }
+                };
+                if (mode == 0) {
+                    // Replay the worker partition with the same graph shapes and rollback tail.
+                    for (int pos : {0, ubatch - 2}) {
+                        const int count = pos == 0 ? ubatch - 2 : 4;
+                        for (int seq = 0; seq < seqs; ++seq) {
+                            common_batch_clear(batch);
+                            for (int j = 0; j < count; ++j) { common_batch_add(batch, token(seq, pos + j), pos + j, {seq}, output(pos + j)); }
+                            decode();
+                        }
+                    }
+                } else {
+                    common_batch_clear(batch);
+                    for (int i = 0; i < length*seqs; ++i) {
+                        const int seq = mode == 3 ? i/length : i%seqs;
+                        const int pos = mode == 3 ? i%length : i/seqs;
+                        common_batch_add(batch, token(seq, pos), pos, {seq}, output(pos));
+                    }
+                    decode();
+                }
+                if (mode == 0 || mode == 2) {
+                    reference_h = std::move(h);
+                    reference_logits = std::move(logits);
+                } else {
+                    const auto h_error = pipeline_difference(reference_h, h);
+                    const auto logit_error = pipeline_difference(reference_logits, logits);
+                    std::printf("MTP rows: check=%s, masked=%d, max_abs_h=%.9g, max_abs_logits=%.9g\n",
+                            mode == 1 ? "workers" : "input order", masked, h_error, logit_error);
+                    pipeline_require(h_error < 0.02 && logit_error < 0.02, "MTP row order differs");
+                }
+            }
+        }
+        owner->set_pipeline(workers, ubatch);
+        struct failure_state {
+            std::vector<llama_batch> batches;
+            llama_token token;
+            llama_pos pos;
+        } failure{{}, tokens[0], ubatch + 2};
+        for (int lane = 0; lane < workers; ++lane) { failure.batches.push_back(llama_batch_init(1, 0, 1)); }
+        const int ret = llama_pipeline_stream_with_executor(owner.get(), 1,
+            [](void * ptr, uint32_t lane, llama_context *, bool ready, llama_batch * next) {
+                auto & s = *static_cast<failure_state *>(ptr);
+                if (ready || !next) { return false; }
+                auto & b = s.batches[lane];
+                common_batch_clear(b);
+                common_batch_add(b, s.token, s.pos, {int32_t(lane)}, true);
+                *next = b;
+                return true;
+            },
+            [](void *, uint32_t lane, llama_context * ctx, const llama_batch & b) {
+                return lane == 0 ? -3 : llama_decode(ctx, b);
+            }, &failure);
+        pipeline_require(ret == -3, "executor error must drain other lanes");
+        for (auto b : failure.batches) { llama_batch_free(b); }
+        owner->set_pipeline(0, ubatch);
+        llama_memory_clear(llama_get_memory(owner.get()), true);
+        common_batch_clear(batch);
+        common_batch_add(batch, tokens[0], 0, {0}, true);
+        pipeline_require(llama_decode(owner.get(), batch) == 0, "decode after executor failure");
+        llama_batch_free(batch);
+        owner.reset();
+        init.reset();
+        llama_backend_free();
+        std::puts("MTP pipeline row and failure checks passed");
+        return 0;
+    }
     auto prefill = [&](bool all_outputs = false) {
         std::vector<float> logits;
         for (int seq = 0; seq < seqs; ++seq) {
@@ -203,6 +296,7 @@ static int test_pipeline(int argc, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "pipeline-mtp") { return test_pipeline(argc - 1, argv + 1, true); }
     if (argc > 1 && std::string(argv[1]) == "pipeline") { return test_pipeline(argc - 1, argv + 1); }
     common_params params;
 

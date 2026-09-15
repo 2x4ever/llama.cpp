@@ -17,6 +17,7 @@
 
 struct llama_model;
 struct llama_context_pipeline;
+struct ggml_backend_workspace_pool;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -54,7 +55,8 @@ struct llama_context {
     void set_pipeline(uint32_t n_workers, uint32_t n_ubatch);
     uint32_t pipeline_n_workers() const;
     uint32_t pipeline_n_ubatch() const;
-    int32_t pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data);
+    int32_t pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data, llama_pipeline_executor executor = nullptr);
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -308,6 +310,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::shared_ptr<llama_memory_i> memory;
+    std::shared_ptr<ggml_backend_workspace_pool> shared_workspace;
     std::shared_ptr<std::mutex> memory_mutex = std::make_shared<std::mutex>();
     std::unique_ptr<llama_context_pipeline> pipeline;
     llama_context_pipeline * pipeline_lane = nullptr;
