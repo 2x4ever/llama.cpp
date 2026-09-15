@@ -52,6 +52,7 @@ struct llama_ubatch {
     int8_t       *  output;     // [n_tokens]         | i   | -
 
     struct data_t {
+        std::vector<int32_t>        batch_ids;
         std::vector<llama_token>    token;
         std::vector<float>          embd;
         std::vector<llama_pos>      pos;

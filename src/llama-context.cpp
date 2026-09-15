@@ -37,6 +37,7 @@ struct llama_context_pipeline {
         std::vector<llama_seq_id *> sequence_ptrs;
         std::vector<int8_t> outputs;
         std::vector<int32_t> output_rows;
+        std::vector<int32_t> token_rows;
         size_t ticket = 0;
         int n_threads = 0;
         int n_threads_batch = 0;
@@ -60,6 +61,8 @@ struct llama_context_pipeline {
     bool stop = false;
     std::atomic<bool> failed{false};
     bool streaming = false;
+    llama_pipeline_executor stream_executor = nullptr;
+    void * stream_data = nullptr;
     struct stream_job {
         llama_batch batch{};
         size_t ticket = 0;
@@ -105,12 +108,17 @@ struct llama_context_pipeline {
                 lock.unlock();
                 int ret = -3;
                 try {
-                    ret = workers[lane]->decode(batch);
+                    ret = stream_executor ? stream_executor(stream_data, lane, workers[lane].get(), batch) : workers[lane]->decode(batch);
                     workers[lane]->synchronize();
                 } catch (const std::exception & error) {
                     ret = -3;
                     workers[lane]->synchronize();
                     LLAMA_LOG_ERROR("%s: pipeline lane failed: %s\n", __func__, error.what());
+                }
+                if (ret != 0) {
+                    std::lock_guard<std::mutex> prepare_lock(*owner.memory_mutex);
+                    failed = true;
+                    prepare_cv.notify_all();
                 }
                 lock.lock();
                 stream_jobs[lane].result = ret;
@@ -145,6 +153,16 @@ struct llama_context_pipeline {
             try {
                 worker.synchronize();
                 if (ret == 0) {
+                    if (owner.cparams.embeddings_nextn) {
+                        const auto width = owner.model.hparams.n_embd_out();
+                        for (size_t j = 0; j < task.token_rows.size(); ++j) {
+                            const int32_t row = owner.cparams.embeddings_nextn_masked ? task.output_rows[j] : task.token_rows[j];
+                            if (row < 0) { continue; }
+                            const auto * src = worker.get_embeddings_nextn_ith(j);
+                            if (!src) { throw std::runtime_error("pipeline nextn row is missing"); }
+                            std::memcpy(owner.embd_nextn.data + int64_t(row)*width, src, width*sizeof(float));
+                        }
+                    }
                     for (size_t j = 0; j < task.output_rows.size(); ++j) {
                         if (task.output_rows[j] < 0) { continue; }
                         const auto * src = worker.get_logits_ith(j);
@@ -548,6 +566,7 @@ llama_context::llama_context(
         if (source) {
             memory = source->memory;
             memory_mutex = source->memory_mutex;
+            shared_workspace = source->shared_workspace;
             if (source->pipeline && source->pipeline->workspace) { pipeline_lane = source->pipeline.get(); }
         } else {
             memory.reset(model.create_memory(params_mem, cparams));
@@ -655,12 +674,12 @@ llama_context::llama_context(
         if (!source && !hparams.no_alloc) {
             const char * workers = std::getenv("LLAMA_PIPELINE_WORKERS");
             if (workers && std::atoi(workers) > 1 && (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && cparams.kv_unified &&
-                    cparams.n_rs_seq == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sampling.samplers.empty()) {
+                    cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sampling.samplers.empty()) {
                 const char * ubatch = std::getenv("LLAMA_PIPELINE_UBATCH");
                 set_pipeline(std::atoi(workers), ubatch ? std::atoi(ubatch) : cparams.n_ubatch);
             } else {
                 if (workers && std::atoi(workers) > 1) {
-                    LLAMA_LOG_WARN("%s: CPU pipeline workers disabled: requires Qwen3.5 or Qwen4Exp, unified KV, default inference, no backend sampling and n_rs_seq=0\n", __func__);
+                    LLAMA_LOG_WARN("%s: CPU pipeline workers disabled: requires Qwen3.5 or Qwen4Exp, unified KV, default inference, no backend sampling\n", __func__);
                 }
                 sched_reserve();
             }
@@ -687,14 +706,20 @@ llama_context::llama_context(
 }
 
 std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, uint32_t n_ubatch) {
-    if ((model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN4EXP) || !cparams.kv_unified || !memory ||
-            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !sampling.samplers.empty() || !loras->empty() || opt_ctx) {
-        throw std::runtime_error("shared execution currently requires a Qwen3.5 or Qwen4Exp unified KV context without backend sampling, LoRA, or training");
+    const bool mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    if ((model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_QWEN35) || !cparams.kv_unified || !memory ||
+            (!mtp && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !sampling.samplers.empty())) || !loras->empty() || opt_ctx) {
+        throw std::runtime_error("shared execution requires Qwen3.5 or Qwen4Exp, unified KV, default or MTP inference, no target backend sampling, and no LoRA or training");
     }
     if (n_batch == 0 || n_ubatch == 0 || n_ubatch > n_batch) {
         throw std::invalid_argument("invalid shared context batch sizes");
     }
     synchronize();
+    if (mtp && !shared_workspace) {
+        shared_workspace.reset(ggml_backend_workspace_pool_new(), ggml_backend_workspace_pool_free);
+        sched_need_reserve = true;
+        sched_reserve();
+    }
     std::lock_guard<std::mutex> lock(*memory_mutex);
     auto params = params_init;
     params.n_ctx = cparams.n_ctx;
@@ -703,7 +728,25 @@ std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, ui
     params.n_ubatch = n_ubatch;
     params.samplers = nullptr;
     params.n_samplers = 0;
-    return std::unique_ptr<llama_context>(new llama_context(model, params, this));
+    auto result = std::unique_ptr<llama_context>(new llama_context(model, params, this));
+    result->set_embeddings_nextn(cparams.embeddings_nextn, cparams.embeddings_nextn_masked);
+    return result;
+}
+
+llama_context * llama_context_create_shared(llama_context * ctx, uint32_t n_batch, uint32_t n_ubatch) {
+    return ctx->create_shared(n_batch, n_ubatch).release();
+}
+
+bool llama_context::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!memory) { return true; }
+    if (!pipeline_lane && !shared_workspace) { return llama_memory_seq_rm(memory.get(), seq_id, p0, p1); }
+    synchronize();
+    std::lock_guard<std::mutex> lock(*memory_mutex);
+    return memory->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return ctx->seq_rm(seq_id, p0, p1);
 }
 
 void llama_context::set_pipeline(uint32_t n_workers, uint32_t n_ubatch) {
@@ -716,8 +759,8 @@ void llama_context::set_pipeline(uint32_t n_workers, uint32_t n_ubatch) {
         sched_reserve();
     }
     if (n_workers < 2) { return; }
-    if (n_workers > 8 || n_ubatch == 0 || n_ubatch > cparams.n_batch || cparams.n_rs_seq != 0) {
-        throw std::invalid_argument("pipeline requires 2..8 workers, a valid ubatch, and n_rs_seq=0");
+    if (n_workers > 8 || n_ubatch == 0 || n_ubatch > cparams.n_batch || (cparams.n_rs_seq && n_ubatch <= cparams.n_rs_seq + 1)) {
+        throw std::invalid_argument("pipeline requires 2..8 workers and an ubatch larger than the rollback depth");
     }
     if (model.n_devices() < 2 || model.n_gpu_layers() <= model.hparams.n_layer_all ||
             model.split_mode() != LLAMA_SPLIT_MODE_LAYER || !cparams.offload_kqv || model.has_tensor_overrides()) {
@@ -748,7 +791,7 @@ void llama_context::set_pipeline(uint32_t n_workers, uint32_t n_ubatch) {
 }
 
 uint32_t llama_context::pipeline_n_workers() const {
-    if (!pipeline || opt_ctx || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+    if (!pipeline || opt_ctx || cparams.embeddings || !cparams.causal_attn ||
             cparams.cb_eval || abort_callback || !sampling.samplers.empty() || !loras->empty() ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool v) { return v; })) {
         return 0;
@@ -764,7 +807,7 @@ uint32_t llama_pipeline_n_ubatch(const llama_context * ctx) {
     return ctx->pipeline_n_ubatch();
 }
 
-int32_t llama_context::pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data) {
+int32_t llama_context::pipeline_stream(uint32_t max_steps, llama_pipeline_callback callback, void * data, llama_pipeline_executor executor) {
     if (pipeline_n_workers() == 0 || max_steps == 0 || !callback) { return -1; }
     auto & pool = *pipeline;
     synchronize();
@@ -781,6 +824,8 @@ int32_t llama_context::pipeline_stream(uint32_t max_steps, llama_pipeline_callba
         pool.stream_jobs.assign(pool.workers.size(), {});
         pool.failed = false;
         pool.next_ticket = 0;
+        pool.stream_executor = executor;
+        pool.stream_data = data;
         pool.streaming = true;
     }
     auto finish = [&] {
@@ -790,6 +835,8 @@ int32_t llama_context::pipeline_stream(uint32_t max_steps, llama_pipeline_callba
                 return std::none_of(pool.stream_jobs.begin(), pool.stream_jobs.end(), [](const auto & job) { return job.busy; });
             });
             pool.streaming = false;
+            pool.stream_executor = nullptr;
+            pool.stream_data = nullptr;
             pool.next_ticket = pool.issued;
         }
         ggml_backend_pipeline_reset(pool.backend);
@@ -865,6 +912,10 @@ uint32_t llama_pipeline_n_workers(const llama_context * ctx) {
 
 int32_t llama_pipeline_stream(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, void * data) {
     return ctx->pipeline_stream(max_steps, callback, data);
+}
+
+int32_t llama_pipeline_stream_with_executor(llama_context * ctx, uint32_t max_steps, llama_pipeline_callback callback, llama_pipeline_executor executor, void * data) {
+    return ctx->pipeline_stream(max_steps, callback, data, executor);
 }
 
 llama_context::~llama_context() {
@@ -993,7 +1044,7 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    auto * workspace = pipeline_lane ? pipeline_lane->workspace.get() : pipeline ? pipeline->workspace.get() : nullptr;
+    auto * workspace = shared_workspace ? shared_workspace.get() : pipeline_lane ? pipeline_lane->workspace.get() : pipeline ? pipeline->workspace.get() : nullptr;
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, !workspace && cparams.pipeline_parallel, cparams.op_offload));
     if (workspace) { ggml_backend_sched_set_workspace_pool(sched.get(), workspace); }
 
@@ -1575,6 +1626,10 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (pipeline) {
+        synchronize();
+        for (auto & worker : pipeline->workers) { worker->set_embeddings_nextn(value, masked); }
+    }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
@@ -2098,7 +2153,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (pipeline_n_workers() > 0 && batch_inp.n_tokens > 1) {
         bool independent = true;
         for (int32_t i = 0; i < batch_inp.n_tokens; ++i) { independent &= !batch_inp.n_seq_id || batch_inp.n_seq_id[i] == 1; }
-        if (independent) { return decode_pipeline(batch_inp); }
+        bool single_verify = cparams.n_rs_seq > 0 && batch_inp.n_tokens <= int32_t(cparams.n_rs_seq + 1);
+        for (int32_t i = 1; single_verify && i < batch_inp.n_tokens; ++i) {
+            single_verify &= !batch_inp.seq_id || batch_inp.seq_id[i][0] == batch_inp.seq_id[0][0];
+        }
+        if (independent && !single_verify) { return decode_pipeline(batch_inp); }
     }
     if (pipeline) { synchronize(); }
     if (memory.use_count() <= 1) {
@@ -2125,7 +2184,7 @@ int llama_context::decode_pipeline(const llama_batch & batch_inp) {
         return -3;
     }
     // Previous output copies must finish before their destination can be reused.
-    if (n_outputs > 0) { synchronize(); }
+    if (n_outputs > 0 || cparams.embeddings_nextn) { synchronize(); }
     if (memory_update(false)) { synchronize(); }
     const uint32_t n_embd = model.hparams.n_embd_inp();
     if (!balloc->init(batch_inp, model.vocab, memory.get(), n_embd, LLAMA_MAX_SEQ, false)) { return -1; }
@@ -2153,13 +2212,20 @@ int llama_context::decode_pipeline(const llama_batch & batch_inp) {
             partitions.push_back(std::move(indices));
         }
     } else {
-        for (size_t start = 0;; start += chunk) {
+        std::map<llama_seq_id, size_t> offsets;
+        for (;;) {
             bool more = false;
             for (const auto & entry : sequences) {
+                auto & start = offsets[entry.first];
                 if (start >= entry.second.size()) { continue; }
                 more = true;
-                const size_t count = std::min(chunk, entry.second.size() - start);
+                const size_t remaining = entry.second.size() - start;
+                size_t count = std::min(chunk, remaining);
+                if (remaining > count && remaining - count <= cparams.n_rs_seq) {
+                    count = remaining - (cparams.n_rs_seq + 1);
+                }
                 partitions.emplace_back(entry.second.begin() + start, entry.second.begin() + start + count);
+                start += count;
             }
             if (!more) { break; }
         }
@@ -2175,6 +2241,7 @@ int llama_context::decode_pipeline(const llama_batch & batch_inp) {
         task.sequence_ptrs.resize(count);
         task.outputs.resize(count);
         task.output_rows.resize(count);
+        task.token_rows = indices;
         for (size_t j = 0; j < count; ++j) {
             const int32_t index = indices[j];
             if (batch.token) { task.tokens[j] = batch.token[index]; }
@@ -2545,7 +2612,18 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (masked) {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                } else {
+                    const auto & ids = ubatch.data->batch_ids;
+                    for (size_t first = 0; first < ids.size();) {
+                        size_t end = first + 1;
+                        while (end < ids.size() && ids[end] == ids[first] + int32_t(end - first)) { ++end; }
+                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + size_t(ids[first])*n_embd,
+                                first*n_embd*sizeof(float), (end - first)*n_embd*sizeof(float));
+                        first = end;
+                    }
+                }
             }
         }
 
@@ -2835,7 +2913,7 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
