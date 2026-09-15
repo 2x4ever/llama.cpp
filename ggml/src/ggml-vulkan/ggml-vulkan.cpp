@@ -900,7 +900,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
         vk::CommandBufferLevel::ePrimary,
         1);
     const std::vector<vk::CommandBuffer> cmd_buffers = device->device.allocateCommandBuffers(command_buffer_alloc_info);
-    p.cmd_buffers.push_back({ cmd_buffers.front(), 0, true });
+    p.cmd_buffers.emplace_back(cmd_buffers.front());
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
@@ -5718,6 +5718,10 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
 
 static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk_command_pool& pool) {
     for (auto& cmd_buffer : pool.cmd_buffers) {
+        if (cmd_buffer.in_use && cmd_buffer.completed_use_counter.load(std::memory_order_acquire) == cmd_buffer.use_counter) {
+            cmd_buffer.buf.reset();
+            cmd_buffer.in_use = false;
+        }
         if (!cmd_buffer.in_use) {
             cmd_buffer.use_counter++;
             cmd_buffer.in_use = true;
@@ -16063,13 +16067,11 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
         vkev->events_submitted.clear();
 
-        // Finished using current command buffer so we flag for reuse
+        // The pool owner resets command buffers. Event waits can run on another thread.
         if (vkev->cmd_buffer) {
-            // Only flag for reuse if it hasn't been reused already
-            if (vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
-                vkev->cmd_buffer->in_use = false;
-                vkev->cmd_buffer->buf.reset();
-            }
+            auto & completed = vkev->cmd_buffer->completed_use_counter;
+            uint64_t previous = completed.load(std::memory_order_relaxed);
+            while (previous < vkev->cmd_buffer_use_counter && !completed.compare_exchange_weak(previous, vkev->cmd_buffer_use_counter, std::memory_order_release, std::memory_order_relaxed)) {}
             vkev->cmd_buffer = nullptr;
         }
     }
