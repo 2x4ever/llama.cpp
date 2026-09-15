@@ -9391,6 +9391,7 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
         const int take = std::min(count, k);
         const auto cmp = [&](int a, int b) { return score[a] > score[b] || (score[a] == score[b] && a < b); };
         std::partial_sort(order, order + take, order + count, cmp);
+        std::sort(order, order + take);
         auto * out = (int32_t *) dst->data + row*dst->ne[0];
         std::fill(out, out + dst->ne[0], -1);
         const auto * members = (const int32_t *) cells->data + (row/nq)*nb*r;

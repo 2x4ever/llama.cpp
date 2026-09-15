@@ -10766,8 +10766,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-        for (int64_t nb : {1, 9}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 4096, nb, false, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, 0, false, 2051));
+        for (int64_t nk : {4096, 4097}) {
+            for (int64_t nb : {1, 65}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, nk, nb, false, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, 0, false, 2051));
+            }
         }
     }
 
