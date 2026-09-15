@@ -1,7 +1,5 @@
 #include "llama-memory-hybrid-idx.h"
 
-#include <algorithm>
-#include <cmath>
 #include <type_traits>
 
 #include "llama-impl.h"
@@ -9,16 +7,22 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
+#include <numeric>
 #include <stdexcept>
 
 //
 // llama_memory_hybrid_idx
 //
+
+static bool llama_qsa_native_enabled() {
+    const char * value = getenv("LLAMA_QSA_NATIVE");
+    return value && std::atoi(value) != 0;
+}
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
@@ -60,7 +64,6 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
-
         // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
@@ -68,10 +71,168 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, model.arch == LLM_ARCH_QWEN4EXP && llama_qsa_native_enabled() && type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q8_0 ? GGML_TYPE_F16 : type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    if (model.arch != LLM_ARCH_QWEN4EXP || !mem_idx || !llama_qsa_native_enabled() || v_trans || type_k != type_v ||
+            (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_0)) {
+        return;
+    }
+    for (uint32_t il : mem_idx->get_layer_ids()) {
+        const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+        if (!ratio) {
+            continue;
+        }
+        const uint32_t capacity = (kv_size + ratio - 1)/ratio;
+        auto & layouts = qsa_layouts[ratio];
+        layouts.resize(mem_idx->get_n_stream());
+        for (auto & layout : layouts) { layout.ratio = ratio; }
+        auto & cache = qsa_caches[il];
+        cache.ctx.reset(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+        cache.keys = ggml_new_tensor_3d(cache.ctx.get(), GGML_TYPE_F32,
+                model.hparams.indexer_head_size, capacity + llama_qsa_batch::update_pad, mem_idx->get_n_stream());
+        ggml_format_name(cache.keys, "idx_pooled_%u", il);
+        const auto buft = ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer);
+        if (model.hparams.no_alloc) {
+            cache.buffer.reset(ggml_backend_buft_alloc_buffer(buft, 0));
+            cache.keys->buffer = cache.buffer.get();
+        } else {
+            cache.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(cache.ctx.get(), buft));
+        }
+        if (!cache.buffer) {
+            throw std::runtime_error("failed to allocate pooled indexer keys");
+        }
+        ggml_backend_buffer_clear(cache.buffer.get(), 0);
+    }
+}
+
+void llama_memory_hybrid_idx::invalidate_qsa() {
+    if (qsa_enabled()) { mem_idx_stale_set(-1, 0); }
+    for (auto & entry : qsa_layouts) {
+        for (auto & layout : entry.second) { layout.valid = false; }
+    }
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_qsa_keys(int32_t il) const {
+    return qsa_caches.at(il).keys;
+}
+
+void llama_memory_hybrid_idx::reserve_qsa(std::map<uint32_t, llama_qsa_batch> & batches) const {
+    for (const auto & entry : qsa_layouts) {
+        auto & batch = batches[entry.first];
+        batch.n_blocks = (mem_idx->get_size() + entry.first - 1)/entry.first;
+        batch.n_updates = batch.n_blocks*mem_idx->get_n_stream();
+    }
+}
+
+void llama_memory_hybrid_idx::prepare_qsa(const llama_kv_cache::slot_info & sinfo, const llama_ubatch & ubatch,
+        int64_t n_kv, std::map<uint32_t, llama_qsa_batch> & batches) {
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t nt = ubatch.n_tokens/ns;
+    for (auto & entry : qsa_layouts) {
+        const uint32_t ratio = entry.first;
+        const int64_t capacity = (mem_idx->get_size() + ratio - 1)/ratio;
+        auto & batch = batches[ratio];
+        batch = {};
+        batch.stream = sinfo.s0;
+        batch.query_cells.reserve(ubatch.n_tokens);
+        for (const auto & stream_cells : sinfo.idxs) {
+            batch.query_cells.insert(batch.query_cells.end(), stream_cells.begin(), stream_cells.end());
+        }
+        if (ubatch.is_pos_2d()) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                batch.native &= ubatch.pos[i] == ubatch.pos[i + ubatch.n_tokens] && ubatch.pos[i] == ubatch.pos[i + 2*ubatch.n_tokens];
+            }
+        }
+        if (batch.native && ubatch.is_pos_2d()) {
+            for (uint32_t i = 0; i < ubatch.n_tokens && batch.native; ++i) {
+                const auto & cells = mem_idx->get_cells(ubatch.seq_id[i][0]);
+                const auto & positions = cells.seq_pos_get(ubatch.seq_id[i][0]);
+                for (auto at = positions.lower_bound({ubatch.pos[i], 0}); at != positions.end() && at->first == ubatch.pos[i]; ++at) {
+                    const auto & ext = cells.ext_get(at->second);
+                    if (ext.x != ubatch.pos[i] || ext.y != ubatch.pos[i]) {
+                        batch.native = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!batch.native) {
+            LLAMA_LOG_DEBUG("%s: native QSA falls back to k-pool attention for spatial M-RoPE positions\n", __func__);
+            invalidate_qsa();
+        }
+        batch.n_blocks = (n_kv + ratio - 1)/ratio;
+        for (uint32_t s = 0; s < ns; ++s) {
+            auto & layout = entry.second[sinfo.s0 + s];
+            layout.update(mem_idx->get_cells(ubatch.seq_id[s*nt][0]), sinfo.idxs[s], ubatch.is_pos_2d());
+            batch.n_blocks = std::max<int64_t>(batch.n_blocks, layout.blocks.size());
+        }
+        batch.cached = batch.n_blocks <= capacity;
+        batch.cells.resize(ratio*batch.n_blocks*ns, 0);
+        std::vector<std::array<int32_t, 4>> positions;
+        for (uint32_t s = 0; s < ns; ++s) {
+            const auto & layout = entry.second[sinfo.s0 + s];
+            for (size_t b = 0; b < layout.blocks.size(); ++b) {
+                std::copy(layout.blocks[b].cells.begin(), layout.blocks[b].cells.end(),
+                          batch.cells.begin() + (s*batch.n_blocks + b)*ratio);
+            }
+            std::vector<int32_t> all;
+            if (!batch.cached) {
+                all.resize(batch.n_blocks);
+                std::iota(all.begin(), all.end(), 0);
+            }
+            const auto & updates = batch.cached ? layout.dirty : all;
+            for (int32_t b : updates) {
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    batch.update_cells.push_back(batch.cells[(s*batch.n_blocks + b)*ratio + j] + (sinfo.s0 + s)*mem_idx->get_size());
+                }
+                positions.push_back((size_t) b < layout.blocks.size() ? layout.blocks[b].pos : std::array<int32_t, 4>{});
+                batch.update_ids.push_back((sinfo.s0 + s)*(capacity + llama_qsa_batch::update_pad) + b);
+            }
+        }
+        // Keep small decode graphs stable when no block completes. Padding writes use private, invisible rows.
+        if (batch.cached && ubatch.n_tokens <= llama_qsa_batch::update_pad) {
+            uint32_t pad = 0;
+            while (positions.size() < ubatch.n_tokens) {
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    batch.update_cells.push_back(sinfo.idxs[0][0] + sinfo.s0*mem_idx->get_size());
+                }
+                positions.push_back({});
+                batch.update_ids.push_back(sinfo.s0*(capacity + llama_qsa_batch::update_pad) + capacity + pad++);
+            }
+        }
+        if (!batch.native) {
+            for (auto & layout : entry.second) { layout.valid = false; }
+        }
+        batch.n_updates = positions.size();
+        batch.update_pos.resize(4*batch.n_updates);
+        for (int sec = 0; sec < 4; ++sec) {
+            for (int64_t i = 0; i < batch.n_updates; ++i) {
+                batch.update_pos[sec*batch.n_updates + i] = positions[i][sec];
+            }
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::set_qsa_inputs(uint32_t ratio, const llama_qsa_batch & batch, const llama_ubatch & ubatch,
+        ggml_tensor * cells, ggml_tensor * visible, ggml_tensor * tail,
+        ggml_tensor * update_cells, ggml_tensor * update_pos, ggml_tensor * update_ids) const {
+    std::memcpy(cells->data, batch.cells.data(), ggml_nbytes(cells));
+    if (update_cells) {
+        std::memcpy(update_cells->data, batch.update_cells.data(), ggml_nbytes(update_cells));
+        std::memcpy(update_pos->data, batch.update_pos.data(), ggml_nbytes(update_pos));
+        if (update_ids) { std::memcpy(update_ids->data, batch.update_ids.data(), ggml_nbytes(update_ids)); }
+    }
+    const int64_t nt = visible->ne[1];
+    for (int64_t i = 0; i < ubatch.n_tokens; ++i) {
+        const auto & layout = qsa_layouts.at(ratio)[batch.stream + i/nt];
+        const std::array<int32_t, 3> pos = { ubatch.pos[i], ubatch.is_pos_2d() ? ubatch.pos[i + ubatch.n_tokens] : 0,
+                ubatch.is_pos_2d() ? ubatch.pos[i + 2*ubatch.n_tokens] : 0 };
+        layout.row(ubatch.seq_id[i][0], pos, batch.query_cells[i], (uint32_t *) visible->data + i*visible->ne[0], visible->ne[0],
+                (int32_t *) tail->data + i*(ratio - 1));
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -147,6 +308,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    invalidate_qsa();
     llama_memory_hybrid::clear(data);
 
     if (mem_idx) {
@@ -183,6 +345,9 @@ llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (seq_id < 0 || (get_mem_attn()->seq_pos_max(seq_id) >= p0 && (p1 < 0 || get_mem_attn()->seq_pos_min(seq_id) < p1))) {
+        invalidate_qsa();
+    }
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
@@ -201,6 +366,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     // only whole sequences are copied: the recurrent state ignores the range, and a shared cell holds a single pool grouping
     GGML_ASSERT(p0 <= 0 && p1 < 0 && "partial seq_cp is not supported");
 
+    invalidate_qsa();
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -212,6 +378,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    invalidate_qsa();
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -222,6 +389,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    invalidate_qsa();
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -233,6 +401,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    invalidate_qsa();
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -248,6 +417,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
+    }
+
+    for (const auto & entry : qsa_caches) {
+        const auto & cache = entry.second;
+        mb[ggml_backend_buffer_get_type(cache.buffer.get())] += ggml_nbytes(cache.keys);
     }
 
     return mb;
@@ -267,6 +441,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    invalidate_qsa();
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -301,6 +476,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    invalidate_qsa();
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
@@ -497,6 +673,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         kpool_st = std::make_unique<kpool_state>(std::move(st));
         i_kpool  = 0;
     }
+    mem->reserve_qsa(qsa_batches);
 }
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
@@ -519,6 +696,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
     sinfos_kpool(mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && mem->get_kpool_by_order() ? sinfos_idx : slot_info_vec_t()),
+    sinfos_qsa(sinfos_idx),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {
     // Sequence edits force the touched positions to re-pool.
@@ -547,6 +725,16 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
+        if (res && mem->qsa_enabled()) {
+            if (!sinfos_qsa.empty()) {
+                mem->prepare_qsa(sinfos_qsa[i_cur], get_ubatch(), get_idx()->get_n_kv(), qsa_batches);
+                if (!qsa_batches.begin()->second.native) {
+                    mem_idx_stale_batch = mem->mem_idx_stale_get();
+                }
+            } else if (ctx_idx->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) {
+                mem->invalidate_qsa();
+            }
+        }
     }
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
@@ -679,7 +867,8 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         ip += (uint32_t) sq.pools.size();
 
         // A sequence edit invalidates only pools ending after the edited position.
-        const llama_pos stale_from = i_cur == 0 ?
+        const bool qsa_fallback = mem->qsa_enabled() && !get_qsa(mem->get_kpool()).native;
+        const llama_pos stale_from = i_cur == 0 || qsa_fallback ?
             mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN;
         if (stale_from == llama_memory_hybrid_idx::POS_CLEAN) {
             continue;

@@ -2488,6 +2488,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_kpool;
+    class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2590,6 +2591,14 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
+        ggml_tensor * build_qsa_top_k(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
         const llama_model & model;
     };
 

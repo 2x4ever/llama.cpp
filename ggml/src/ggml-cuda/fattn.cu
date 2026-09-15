@@ -145,7 +145,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -726,7 +726,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_QSA_ATTN);
+    if (dst->op == GGML_OP_QSA_ATTN) {
+        return ggml_nbytes(dst);
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];

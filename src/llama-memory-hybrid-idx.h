@@ -1,11 +1,26 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
+#include "llama-qsa.h"
 
 #include <array>
 #include <limits>
 #include <memory>
 #include <vector>
+
+struct llama_qsa_batch {
+    static constexpr uint32_t update_pad = 32;
+    int64_t n_blocks = 0;
+    int64_t n_updates = 0;
+    uint32_t stream = 0;
+    bool cached = true;
+    bool native = true;
+    std::vector<int32_t> cells;
+    std::vector<int32_t> query_cells;
+    std::vector<int32_t> update_cells;
+    std::vector<int32_t> update_pos;
+    std::vector<int64_t> update_ids;
+};
 
 //
 // llama_memory_hybrid_idx
@@ -106,6 +121,16 @@ public:
 
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
+    bool qsa_enabled() const { return !qsa_caches.empty(); }
+    void invalidate_qsa();
+    void prepare_qsa(const llama_kv_cache::slot_info & sinfo, const llama_ubatch & ubatch,
+                     int64_t n_kv, std::map<uint32_t, llama_qsa_batch> & batches);
+    void reserve_qsa(std::map<uint32_t, llama_qsa_batch> & batches) const;
+    ggml_tensor * get_qsa_keys(int32_t il) const;
+    void set_qsa_inputs(uint32_t ratio, const llama_qsa_batch & batch, const llama_ubatch & ubatch,
+                        ggml_tensor * cells, ggml_tensor * visible, ggml_tensor * tail,
+                        ggml_tensor * update_cells, ggml_tensor * update_pos, ggml_tensor * update_ids) const;
+
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -128,6 +153,13 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+    struct qsa_cache {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor * keys = nullptr;
+    };
+    std::map<int32_t, qsa_cache> qsa_caches;
+    std::map<uint32_t, std::vector<llama_qsa_layout>> qsa_layouts;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -197,6 +229,16 @@ public:
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+    bool qsa_enabled() const { return mem && mem->qsa_enabled(); }
+    const llama_qsa_batch & get_qsa(uint32_t ratio) const { return qsa_batches.at(ratio); }
+    ggml_tensor * get_qsa_keys(int32_t il) const { return mem->get_qsa_keys(il); }
+    ggml_tensor * get_qsa_raw(int32_t il) const { return mem->get_mem_idx()->get_k_storage(il); }
+    void set_qsa_inputs(uint32_t ratio, const llama_ubatch & ubatch,
+                        ggml_tensor * cells, ggml_tensor * visible, ggml_tensor * tail,
+                        ggml_tensor * update_cells, ggml_tensor * update_pos, ggml_tensor * update_ids) const {
+        mem->set_qsa_inputs(ratio, get_qsa(ratio), ubatch, cells, visible, tail, update_cells, update_pos, update_ids);
+    }
+
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
@@ -208,6 +250,8 @@ private:
     // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
     // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
     const slot_info_vec_t sinfos_kpool;
+    const slot_info_vec_t sinfos_qsa;
+    std::map<uint32_t, llama_qsa_batch> qsa_batches;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
