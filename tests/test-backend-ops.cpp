@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <atomic>
@@ -12029,6 +12030,136 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+static bool test_backend_workspace(ggml_backend_dev_t dev) {
+    constexpr int n_lanes = 4;
+    constexpr int n_values = 262144;
+    auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_dev_t second = cpu;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto other = ggml_backend_dev_get(i);
+        if (other != dev && ggml_backend_dev_type(other) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_backend_reg(other) == ggml_backend_dev_backend_reg(dev)) {
+            second = other;
+            break;
+        }
+    }
+    std::vector<ggml_backend_dev_t> devices{dev};
+    if (second != dev) { devices.push_back(second); }
+    if (devices.back() != cpu) { devices.push_back(cpu); }
+    const bool shares = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+        !ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev)) &&
+        (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0 ||
+         strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 ||
+         strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0);
+
+    struct lane {
+        std::vector<ggml_backend_ptr> backends;
+        ggml_context_ptr ctx;
+        ggml_backend_sched_ptr sched;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * scratch = nullptr;
+        ggml_tensor * boundary = nullptr;
+        ggml_tensor * output = nullptr;
+    };
+    std::unique_ptr<ggml_backend_workspace_pool, decltype(&ggml_backend_workspace_pool_free)> pool(ggml_backend_workspace_pool_new(), ggml_backend_workspace_pool_free);
+    std::unique_ptr<ggml_backend_pipeline, decltype(&ggml_backend_pipeline_free)> pipeline(ggml_backend_pipeline_new(), ggml_backend_pipeline_free);
+    std::array<lane, n_lanes> lanes;
+    for (auto & l : lanes) {
+        std::vector<ggml_backend_t> backends;
+        for (auto d : devices) {
+            l.backends.emplace_back(ggml_backend_dev_init(d, nullptr));
+            GGML_ASSERT(l.backends.back());
+            backends.push_back(l.backends.back().get());
+            auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(d), "ggml_backend_set_n_threads");
+            if (set_threads) { set_threads(backends.back(), 2); }
+        }
+        l.sched.reset(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), 64, true, false));
+        ggml_backend_sched_set_workspace_pool(l.sched.get(), pool.get());
+    }
+    auto build = [&](lane & l, int count) {
+        ggml_backend_sched_reset(l.sched.get());
+        l.ctx.reset(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true}));
+        GGML_ASSERT(l.ctx);
+        l.graph = ggml_new_graph_custom(l.ctx.get(), 32, false);
+        l.input = ggml_new_tensor_1d(l.ctx.get(), GGML_TYPE_F32, count);
+        ggml_set_input(l.input);
+        ggml_backend_sched_set_tensor_backend(l.sched.get(), l.input, l.backends[0].get());
+        auto * cur = l.input;
+        for (int stage = 0; stage < 3; ++stage) {
+            auto backend = l.backends[stage == 1 && devices.size() > 1 ? 1 : 0].get();
+            cur = ggml_scale_bias(l.ctx.get(), cur, 1.0f, 1.0f);
+            ggml_backend_sched_set_tensor_backend(l.sched.get(), cur, backend);
+            if (stage == 0) { l.scratch = cur; }
+            cur = ggml_scale_bias(l.ctx.get(), cur, 1.0f, 1.0f);
+            ggml_backend_sched_set_tensor_backend(l.sched.get(), cur, backend);
+            if (stage == 0) { l.boundary = cur; }
+            if (stage != 2) { cur = ggml_view_1d(l.ctx.get(), cur, count, 0); }
+        }
+        l.output = cur;
+        ggml_set_output(l.output);
+        ggml_build_forward_expand(l.graph, l.output);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(l.sched.get(), l.graph));
+    };
+    for (auto & l : lanes) { build(l, n_values); }
+    auto buft = ggml_backend_dev_buffer_type(dev);
+    const size_t shared_size = ggml_backend_workspace_pool_get_buffer_size(pool.get(), buft);
+    if (shares) {
+        GGML_ASSERT(shared_size > 0);
+        for (int i = 0; i < n_lanes; ++i) {
+            auto & l = lanes[i];
+            GGML_ASSERT(l.scratch->buffer == lanes[0].scratch->buffer);
+            GGML_ASSERT(l.scratch->data == lanes[0].scratch->data);
+            GGML_ASSERT(l.output->buffer != l.scratch->buffer && l.input->buffer != l.scratch->buffer);
+            GGML_ASSERT(l.boundary->buffer != l.scratch->buffer);
+            if (i) { GGML_ASSERT(l.output->buffer != lanes[0].output->buffer); }
+        }
+    } else {
+        GGML_ASSERT(shared_size == 0);
+    }
+    std::vector<float> data(n_values);
+    for (int round = 0; round < 16; ++round) {
+        for (int i = 0; i < n_lanes; ++i) {
+            std::fill(data.begin(), data.end(), float(100 * i + round));
+            ggml_backend_tensor_set(lanes[i].input, data.data(), 0, data.size() * sizeof(float));
+            ggml_backend_sched_prepare_pipeline(lanes[i].sched.get(), pipeline.get());
+        }
+        std::vector<std::future<ggml_status>> jobs;
+        for (int i = n_lanes - 1; i >= 0; --i) {
+            jobs.push_back(std::async(std::launch::async, [&, i] { return ggml_backend_sched_graph_compute_async(lanes[i].sched.get(), lanes[i].graph); }));
+        }
+        for (auto & job : jobs) { GGML_ASSERT(job.get() == GGML_STATUS_SUCCESS); }
+        for (int i = 0; i < n_lanes; ++i) {
+            ggml_backend_sched_synchronize(lanes[i].sched.get());
+            ggml_backend_tensor_get(lanes[i].output, data.data(), 0, data.size() * sizeof(float));
+            for (float value : data) { GGML_ASSERT(value == float(100 * i + round + 6)); }
+        }
+    }
+    ggml_backend_sched_prepare_pipeline(lanes[0].sched.get(), pipeline.get());
+    ggml_backend_sched_prepare_pipeline(lanes[1].sched.get(), pipeline.get());
+    ggml_backend_sched_cancel_pipeline(lanes[0].sched.get());
+    const auto status = ggml_backend_sched_graph_compute_async(lanes[1].sched.get(), lanes[1].graph);
+    GGML_ASSERT(status == (shares ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS));
+    ggml_backend_sched_synchronize(lanes[1].sched.get());
+    ggml_backend_pipeline_reset(pipeline.get());
+    ggml_backend_sched_prepare_pipeline(lanes[1].sched.get(), pipeline.get());
+    GGML_ASSERT(ggml_backend_sched_graph_compute(lanes[1].sched.get(), lanes[1].graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_pipeline_reset(pipeline.get());
+    pipeline.reset();
+
+    const auto old_data = lanes[1].scratch->data;
+    build(lanes[0], 2 * n_values);
+    if (shares) {
+        GGML_ASSERT(lanes[1].scratch->data == old_data);
+        GGML_ASSERT(ggml_backend_workspace_pool_get_buffer_size(pool.get(), buft) > shared_size);
+    }
+    lanes[0].sched.reset();
+    GGML_ASSERT(ggml_backend_workspace_pool_get_buffer_size(pool.get(), buft) == shared_size);
+    for (int i = 1; i < n_lanes; ++i) { lanes[i].sched.reset(); }
+    GGML_ASSERT(ggml_backend_workspace_pool_get_buffer_size(pool.get(), buft) == 0);
+    printf("Workspace: four lanes, views, private boundaries, reverse submission, cancellation, reuse and buffer growth passed; shared bytes on %s = %zu.\n", ggml_backend_dev_name(dev), shared_size);
+    return true;
+}
+
 static bool test_backend_events(ggml_backend_t backend) {
     constexpr int n_slots = 8;
     constexpr int n_rounds = 128;
@@ -12130,6 +12261,7 @@ static void usage(char ** argv) {
     printf("      - perf (performance evaluation)\n");
     printf("      - support (probe backend operation support)\n");
     printf("      - events (check cross-thread event waits and command buffer reuse)\n");
+    printf("      - workspace (check shared scheduler scratch and execution dependencies)\n");
     printf("    op names for -o are as given by ggml_op_desc() (e.g. ADD, MUL_MAT, etc),\n");
     printf("        optionally including the full test case string (e.g. \"ADD(type=f16,ne=[1,1,8,1],nr=[1,1,1,1],nf=1)\")\n");
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
@@ -12142,6 +12274,7 @@ static void usage(char ** argv) {
 int main(int argc, char ** argv) {
     test_mode mode = MODE_TEST;
     bool events = false;
+    bool workspace = false;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
     const char * backend_filter = nullptr;
@@ -12152,6 +12285,8 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
             mode = MODE_TEST;
+        } else if (strcmp(argv[i], "workspace") == 0) {
+            workspace = true;
         } else if (strcmp(argv[i], "events") == 0) {
             events = true;
         } else if (strcmp(argv[i], "perf") == 0) {
@@ -12266,7 +12401,7 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = events ? test_backend_events(backend.get()) :
+        bool ok = workspace ? test_backend_workspace(dev) : events ? test_backend_events(backend.get()) :
             test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
 
         if (ok) {
