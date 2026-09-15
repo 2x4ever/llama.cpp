@@ -103,6 +103,15 @@ public:
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
 
+    bool has_pending_tasks() {
+        std::lock_guard<std::mutex> lock(mutex_tasks);
+        if (!running) { return true; }
+        for (const auto & task : queue_tasks) {
+            if (task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) { return true; }
+        }
+        return false;
+    }
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
