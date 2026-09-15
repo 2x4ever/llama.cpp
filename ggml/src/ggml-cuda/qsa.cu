@@ -1,5 +1,6 @@
 #include "qsa.cuh"
 #include "top-k.cuh"
+#include "fattn.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define launch_fattn qsa_launch_fattn
 #define ggml_cuda_flash_attn_ext_mma_f16_case qsa_mma_case
@@ -26,7 +27,7 @@ static __global__ void qsa_expand(const float * masked, const int * chosen, cons
     int cell = -1;
     if (j < k*r) {
         const int b = chosen[int64_t(row)*k + j/r];
-        if (isfinite(masked[int64_t(row)*nb + b])) {
+        if (b < nb && isfinite(masked[int64_t(row)*nb + b])) {
             cell = cells[(int64_t(original_row/nq)*nb + b)*r + j%r];
         }
     } else {
@@ -48,7 +49,8 @@ static __global__ void qsa_order(const float * scores, int * chosen, int nb, int
     extern __shared__ int ids[];
     const int row = blockIdx.x;
     for (int i = threadIdx.x; i < padded; i += blockDim.x) {
-        ids[i] = i < k ? chosen[int64_t(row)*k + i] : INT_MAX;
+        const int b = i < k ? chosen[int64_t(row)*k + i] : INT_MAX;
+        ids[i] = b < nb && isfinite(scores[int64_t(row)*nb + b]) ? b : INT_MAX;
     }
     __syncthreads();
     for (int span = 2; span <= padded; span *= 2) {
@@ -57,9 +59,7 @@ static __global__ void qsa_order(const float * scores, int * chosen, int nb, int
                 const int j = i ^ step;
                 if (j <= i) { continue; }
                 const int a = ids[i], b = ids[j];
-                const float va = a == INT_MAX ? -INFINITY : scores[int64_t(row)*nb + a];
-                const float vb = b == INT_MAX ? -INFINITY : scores[int64_t(row)*nb + b];
-                const bool before = va > vb || (va == vb && a < b);
+                const bool before = a < b;
                 if (before == ((i & span) != 0)) {
                     ids[i] = b; ids[j] = a;
                 }
@@ -114,7 +114,7 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         qsa_shape(input, nb, count); input.data = masked.ptr;
         qsa_shape(selected, k, count); selected.data = chosen.ptr; selected.src[0] = &input;
         ggml_cuda_op_top_k(ctx, &selected);
-        // Backend top-k can return an arbitrary order. Keep the attention reduction order stable.
+        // Visit selected blocks in ID order, independent of their scores.
         qsa_order<<<count, 256, padded*sizeof(int), ctx.stream()>>>(masked.ptr, chosen.ptr, nb, k, padded);
         qsa_expand<<<(int64_t(dst->ne[0])*count + 255)/256, 256, 0, ctx.stream()>>>(masked.ptr, chosen.ptr,
             (const int *) dst->src[1]->data, (const int *) dst->src[3]->data, (int *) dst->data, nb, nq, r, k, start, count);
@@ -207,6 +207,51 @@ static __global__ void qsa_zero_empty(const int * indices, float * out, int widt
     for (int j = threadIdx.x; j < row_size; j += blockDim.x) { out[int64_t(blockIdx.x)*row_size + j] = 0.0f; }
 }
 
+static __global__ void qsa_mask_fill(half * mask, int64_t count) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < count) { mask[i] = __float2half(-INFINITY); }
+}
+
+static __global__ void qsa_mask_scatter(const int * indices, half * mask, int width, int nk, int rows) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < int64_t(width)*rows && indices[i] >= 0 && indices[i] < nk) {
+        mask[(i/width)*nk + indices[i]] = __float2half(0.0f);
+    }
+}
+
+static bool qsa_attn_dense(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * indices = dst->src[5];
+    const int64_t nk = dst->src[1]->ne[1], rows = q->ne[1]*q->ne[3];
+    // Small batches keep indexed reduction order when KV cells move.
+    // Bound dense prefill masks independently of the context limit.
+    if (q->ne[1] < 32 || nk > 4096 || nk*rows > 4*1024*1024 || getenv("LLAMA_QSA_SCALAR")) { return false; }
+
+    ggml_tensor dense = *dst, mask = *indices;
+    mask.type = GGML_TYPE_F16;
+    mask.ne[0] = nk;
+    mask.nb[0] = sizeof(half);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) { mask.nb[i] = mask.nb[i - 1]*mask.ne[i - 1]; }
+    dense.op = GGML_OP_FLASH_ATTN_EXT;
+    dense.src[3] = &mask;
+    dense.src[5] = nullptr;
+    ggml_flash_attn_ext_set_n_kv_max(&dense, 0);
+    if (!ggml_cuda_flash_attn_ext_supported(ctx.device, &dense)) { return false; }
+    // Quantized KV must stay packed; use indexed attention if dense attention needs an F16 copy.
+    if (ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &dense) != ggml_nbytes(dst)) { return false; }
+
+    ggml_cuda_pool_alloc<half> memory(ctx.pool(), nk*rows);
+    mask.data = memory.ptr;
+    qsa_mask_fill<<<(nk*rows + 255)/256, 256, 0, ctx.stream()>>>(memory.ptr, nk*rows);
+    qsa_mask_scatter<<<(indices->ne[0]*rows + 255)/256, 256, 0, ctx.stream()>>>(
+        (const int *) indices->data, memory.ptr, indices->ne[0], nk, rows);
+    ggml_cuda_flash_attn_ext(ctx, &dense);
+    qsa_zero_empty<<<rows, 128, 0, ctx.stream()>>>(
+        (const int *) indices->data, (float *) dst->data, indices->ne[0], q->ne[2]*dst->src[2]->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template<bool kv_q8>
 static void qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const auto * q = dst->src[0]; const auto * k = dst->src[1]; const auto * v = dst->src[2];
@@ -236,6 +281,7 @@ static void qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (qsa_attn_dense(ctx, dst)) { return; }
     if (dst->src[1]->type == GGML_TYPE_Q8_0) {
         qsa_attn<true>(ctx, dst);
     } else {
