@@ -19,6 +19,10 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1327,10 +1331,159 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+struct common_speculative_mtp_batcher {
+    using continuation = std::function<bool(llama_context *, int32_t)>;
+
+    struct request {
+        llama_batch * batch;
+        llama_context * single_ctx;
+        continuation next;
+        std::exception_ptr error;
+        int32_t result = 0;
+        bool done = false;
+    };
+
+    llama_context * ctx;
+    const int32_t capacity;
+    const int32_t n_embd;
+    std::vector<llama_token> tokens;
+    std::vector<float> embeddings;
+    std::vector<llama_pos> positions;
+    std::vector<int32_t> seq_counts;
+    std::vector<llama_seq_id> sequences;
+    std::vector<llama_seq_id *> seq_ptrs;
+    std::vector<int8_t> outputs;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<request *> pending;
+    std::vector<request *> ready_jobs;
+    bool running = false;
+    uint64_t n_batches = 0;
+    uint64_t n_requests = 0;
+    uint64_t n_merged = 0;
+    size_t max_requests = 0;
+
+    explicit common_speculative_mtp_batcher(llama_context * ctx) :
+        ctx(ctx), capacity(llama_n_batch(ctx)), n_embd(llama_model_n_embd_out(llama_get_model(ctx))),
+        tokens(capacity), embeddings((size_t) capacity*n_embd), positions(capacity), seq_counts(capacity, 1),
+        sequences(capacity), seq_ptrs(capacity), outputs(capacity) {
+        ready_jobs.reserve(capacity);
+        for (int32_t i = 0; i < capacity; ++i) { seq_ptrs[i] = &sequences[i]; }
+    }
+
+    ~common_speculative_mtp_batcher() {
+        GGML_ASSERT(!running && pending.empty());
+        SPC_INF("MTP batcher: batches=%" PRIu64 ", requests=%" PRIu64 ", merged=%" PRIu64 ", max_requests=%zu\n",
+                n_batches, n_requests, n_merged, max_requests);
+    }
+
+    int32_t decode(llama_batch & batch, continuation next = {}, llama_context * single_ctx = nullptr) {
+        GGML_ASSERT(batch.n_tokens > 0 && batch.n_tokens <= capacity);
+        request item;
+        item.batch = &batch;
+        item.single_ctx = single_ctx ? single_ctx : ctx;
+        item.next = std::move(next);
+        std::unique_lock<std::mutex> lock(mutex);
+        pending.push_back(&item);
+        while (!item.done) {
+            if (running) {
+                ready.wait(lock, [&] { return item.done || !running; });
+                continue;
+            }
+            // The caller runs ready work until its own request completes.
+            running = true;
+            lock.unlock();
+            run(item);
+            lock.lock();
+            running = false;
+            ready.notify_all();
+        }
+        if (item.error) { std::rethrow_exception(item.error); }
+        return item.result;
+    }
+
+    void run(request & owner) {
+        while (!owner.done) {
+            auto & jobs = ready_jobs;
+            jobs.clear();
+            llama_batch merged = {0, tokens.data(), embeddings.data(), positions.data(), seq_counts.data(), seq_ptrs.data(), outputs.data()};
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(!pending.empty());
+                // Take ready work only. Never wait for another lane to reach the draft stage.
+                while (!pending.empty() && merged.n_tokens + pending.front()->batch->n_tokens <= capacity) {
+                    auto * job = pending.front();
+                    pending.pop_front();
+                    jobs.push_back(job);
+                    const auto & src = *job->batch;
+                    for (int32_t i = 0; i < src.n_tokens; ++i) {
+                        GGML_ASSERT(src.n_seq_id[i] == 1);
+                        const int32_t j = merged.n_tokens++;
+                        tokens[j] = src.token[i];
+                        positions[j] = src.pos[i];
+                        sequences[j] = src.seq_id[i][0];
+                        outputs[j] = src.logits[i];
+                        std::memcpy(embeddings.data() + (size_t) j*n_embd, src.embd + (size_t) i*n_embd, n_embd*sizeof(float));
+                    }
+                }
+            }
+            ++n_batches;
+            n_requests += jobs.size();
+            max_requests = std::max(max_requests, jobs.size());
+            if (jobs.size() > 1 && n_merged++ == 0) {
+                SPC_INF("MTP batcher merged %zu ready lane steps into %d tokens\n", jobs.size(), merged.n_tokens);
+            }
+            int32_t ret = 0;
+            std::exception_ptr error;
+            auto * output_ctx = jobs.size() == 1 ? jobs.front()->single_ctx : ctx;
+            try {
+                ret = llama_decode(output_ctx, merged);
+                llama_synchronize(output_ctx);
+            } catch (...) {
+                error = std::current_exception();
+            }
+            int32_t offset = 0;
+            for (auto * job : jobs) {
+                const int32_t count = job->batch->n_tokens;
+                bool again = false;
+                auto job_error = error;
+                try {
+                    if (!job_error && ret == 0 && job->next) { again = job->next(output_ctx, offset); }
+                } catch (...) {
+                    job_error = std::current_exception();
+                }
+                offset += count;
+                std::lock_guard<std::mutex> lock(mutex);
+                if (again && !job_error) {
+                    // Requeue the next draft step before dispatch, so it can join other ready lanes.
+                    GGML_ASSERT(job->batch->n_tokens > 0 && job->batch->n_tokens <= capacity);
+                    try {
+                        pending.push_back(job);
+                    } catch (...) {
+                        job_error = std::current_exception();
+                    }
+                }
+                if (!again || job_error) {
+                    job->result = ret;
+                    job->error = job_error;
+                    job->done = true;
+                    ready.notify_all();
+                }
+            }
+        }
+    }
+};
+
+common_speculative_mtp_batcher_ptr common_speculative_mtp_batcher_init(llama_context * ctx_dft) {
+    return std::make_shared<common_speculative_mtp_batcher>(ctx_dft);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
+
+    common_speculative_mtp_batcher_ptr batcher;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1567,7 +1720,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = batcher ? batcher->decode(batch, {}, ctx_dft) : llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1639,29 +1792,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
-        while (n_drafting > 0) {
-            // each step decodes under a different head, i.e. a different decoder layer, and
-            // KV is per layer. process() filled this layer's KV only for positions < pos0
-            // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
-            // draft region (the seq_rm lower bound is pos0, leaving the prompt KV intact)
-            // and select head i so it rebuilds its own layer's KV there; decoding just the
-            // latest token would leave its attention reading cells only another head wrote.
-            if (chain_heads) {
-                auto * mem_dft = llama_get_memory(ctx_dft);
-                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    if (drafting[seq_id]) {
-                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
-                    }
-                }
-                llama_set_nextn_layer_offset(ctx_dft, i);
-            }
-
-            int ret = llama_decode(ctx_dft, batch);
-            if (ret != 0) {
-                SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
-                break;
-            }
-
+        auto consume = [&](llama_context * output_ctx, int32_t offset) {
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
@@ -1674,8 +1805,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                common_sampler_sample(smpl, output_ctx, offset + i_last[seq_id], true);
+                const float * h_row = llama_get_embeddings_nextn_ith(output_ctx, offset + i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1733,11 +1864,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 
-            if (batch.n_tokens == 0) {
-                break;
-            }
-
+            if (batch.n_tokens == 0) { return false; }
             ++i;
+            return true;
+        };
+
+        if (batcher && n_drafting > 0) {
+            if (batcher->decode(batch, consume, ctx_dft) != 0) { throw std::runtime_error("MTP batched draft failed"); }
+        } else {
+            while (n_drafting > 0) {
+                // Each head owns its KV. Rebuild its draft prefix before switching heads.
+                if (chain_heads) {
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        if (drafting[seq_id]) {
+                            llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
+                        }
+                    }
+                    llama_set_nextn_layer_offset(ctx_dft, i);
+                }
+
+                int ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                    break;
+                }
+
+                if (!consume(ctx_dft, 0)) { break; }
+            }
         }
 
         if (chain_heads) {
@@ -2226,7 +2380,8 @@ bool common_speculative_supports_pipeline(const common_speculative * spec) {
     return mtp.n_mtp_layers == 1 && !mtp.is_mem_shared && !mtp.chain_heads;
 }
 
-common_speculative_ptr common_speculative_clone_mtp(const common_speculative * spec, llama_context * ctx_tgt, llama_context * ctx_dft) {
+common_speculative_ptr common_speculative_clone_mtp(const common_speculative * spec, llama_context * ctx_tgt, llama_context * ctx_dft,
+        common_speculative_mtp_batcher_ptr batcher) {
     if (!common_speculative_supports_pipeline(spec)) { return {}; }
     const auto & source = static_cast<const common_speculative_impl_draft_mtp &>(*spec->impls[0]);
     common_params_speculative params;
@@ -2238,6 +2393,7 @@ common_speculative_ptr common_speculative_clone_mtp(const common_speculative * s
     result->impl_last.resize(spec->dparams.size(), nullptr);
     result->synth_probs = spec->synth_probs;
     auto impl = std::make_unique<common_speculative_impl_draft_mtp>(params, spec->dparams.size());
+    impl->batcher = std::move(batcher);
     impl->pending_h = source.pending_h;
     result->impls.push_back(std::move(impl));
     return common_speculative_ptr(result.release());
