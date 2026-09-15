@@ -12647,13 +12647,106 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+static bool test_backend_events(ggml_backend_t backend) {
+    constexpr int n_slots = 8;
+    constexpr int n_rounds = 128;
+    constexpr int n_nodes = 32;
+    constexpr int n_values = 4096;
+    auto dev = ggml_backend_get_device(backend);
+    ggml_backend_event_ptr probe(ggml_backend_event_new(dev));
+    if (!probe) {
+        printf("Backend events are not supported; skipping.\n");
+        return true;
+    }
+
+    struct event_slot {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_backend_event_ptr event;
+        ggml_cgraph * graph;
+        ggml_tensor * output;
+        std::atomic<bool> pending{false};
+    };
+    std::array<event_slot, n_slots> slots;
+    std::vector<float> input(n_values);
+    for (int i = 0; i < n_values; ++i) {
+        input[i] = float(i);
+    }
+    for (auto & slot : slots) {
+        slot.ctx.reset(ggml_init({ggml_tensor_overhead() * (n_nodes + 1) + ggml_graph_overhead_custom(128, false), nullptr, true}));
+        GGML_ASSERT(slot.ctx);
+        slot.graph = ggml_new_graph_custom(slot.ctx.get(), 128, false);
+        auto * src = ggml_new_tensor_1d(slot.ctx.get(), GGML_TYPE_F32, n_values);
+        slot.output = src;
+        for (int j = 0; j < n_nodes; ++j) {
+            slot.output = ggml_scale_bias(slot.ctx.get(), slot.output, 1.0f, 1.0f);
+        }
+        ggml_build_forward_expand(slot.graph, slot.output);
+        slot.buffer.reset(ggml_backend_alloc_ctx_tensors(slot.ctx.get(), backend));
+        slot.event.reset(ggml_backend_event_new(dev));
+        GGML_ASSERT(slot.buffer && slot.event);
+        ggml_backend_tensor_set(src, input.data(), 0, input.size() * sizeof(float));
+    }
+
+    // Each event has one waiter. The owner records it again only after that wait returns.
+    std::thread waiter([&] {
+        for (int i = 0; i < n_rounds * n_slots; ++i) {
+            auto & slot = slots[i % n_slots];
+            while (!slot.pending.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            ggml_backend_event_synchronize(slot.event.get());
+            slot.pending.store(false, std::memory_order_release);
+        }
+    });
+    for (int i = 0; i < n_rounds * n_slots; ++i) {
+        auto & slot = slots[i % n_slots];
+        while (slot.pending.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        GGML_ASSERT(ggml_backend_graph_compute_async(backend, slot.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_event_record(slot.event.get(), backend);
+        slot.pending.store(true, std::memory_order_release);
+    }
+    waiter.join();
+    ggml_backend_synchronize(backend);
+
+    // Wait for an old event after synchronization has made its command buffer reusable.
+    for (int i = 0; i < n_rounds; ++i) {
+        auto & slot = slots[i % n_slots];
+        GGML_ASSERT(ggml_backend_graph_compute_async(backend, slot.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_event_record(probe.get(), backend);
+        ggml_backend_synchronize(backend);
+        GGML_ASSERT(ggml_backend_graph_compute_async(backend, slot.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_event_record(slot.event.get(), backend);
+        std::thread late_waiter([&] { ggml_backend_event_synchronize(probe.get()); });
+        late_waiter.join();
+        ggml_backend_event_synchronize(slot.event.get());
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> output(n_values);
+    for (auto & slot : slots) {
+        ggml_backend_tensor_get(slot.output, output.data(), 0, output.size() * sizeof(float));
+        for (int i = 0; i < n_values; ++i) {
+            if (output[i] != input[i] + n_nodes) {
+                printf("Event test mismatch at %d: %f != %f\n", i, output[i], input[i] + n_nodes);
+                return false;
+            }
+        }
+    }
+    printf("Events: %d cross-thread waits, %d delayed waits, output checks passed.\n", n_rounds * n_slots, n_rounds);
+    return true;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [options]\n\n", argv[0]);
     printf("Valid modes:\n");
     printf("  test     (default) compare with CPU backend for correctness\n");
     printf("  grad     compare gradients from backpropagation with method of finite differences\n");
     printf("  perf     performance evaluation\n");
-    printf("  support  probe backend operation support\n\n");
+    printf("  support  probe backend operation support\n");
+    printf("  events   check cross-thread event waits and command buffer reuse\n\n");
     printf("Options:\n");
     printf("  -o <op|regex,..>            comma separated list of exact op names (as given by ggml_op_desc()),\n");
     printf("                              full test case strings, and/or regexes matched against the op name\n");
@@ -12675,6 +12768,7 @@ static void usage(char ** argv) {
 
 int main(int argc, char ** argv) {
     test_mode mode = MODE_TEST;
+    bool events = false;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
     const char * backend_filter = nullptr;
@@ -12685,6 +12779,8 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
             mode = MODE_TEST;
+        } else if (strcmp(argv[i], "events") == 0) {
+            events = true;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
         } else if (strcmp(argv[i], "grad") == 0) {
@@ -12797,7 +12893,8 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool ok = events ? test_backend_events(backend.get()) :
+            test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
 
         if (ok) {
             n_ok++;

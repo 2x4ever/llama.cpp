@@ -48,6 +48,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 
 #include <cmath>
 
@@ -322,8 +323,11 @@ struct ggml_backend_vk_buffer_type_context {
 
 struct vk_command_buffer {
     vk::CommandBuffer buf;
-    uint64_t use_counter = 0;
-    bool in_use = false;
+    uint64_t use_counter = 1;
+    std::atomic<uint64_t> completed_use_counter{0};
+    bool in_use = true;
+
+    explicit vk_command_buffer(vk::CommandBuffer buf) : buf(buf) {}
 };
 
 struct vk_queue;
