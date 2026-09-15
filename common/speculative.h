@@ -108,6 +108,12 @@ struct common_speculative_deleter {
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
 
+// Clone a single-head MTP driver onto shared execution contexts.
+bool common_speculative_supports_pipeline(const common_speculative * spec);
+// Copy per-sequence state only while both drivers are idle.
+void common_speculative_copy_mtp_state(const common_speculative * src, common_speculative * dst, llama_seq_id seq_id);
+common_speculative_ptr common_speculative_clone_mtp(const common_speculative * spec, llama_context * ctx_tgt, llama_context * ctx_dft);
+
 struct common_speculative_init_result {
     common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
     ~common_speculative_init_result();
