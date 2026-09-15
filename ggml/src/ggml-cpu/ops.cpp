@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -9355,9 +9357,106 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * scores = dst->src[0];
+    const auto * cells = dst->src[1];
+    const auto * queries = dst->src[4];
+    const int nb = cells->ne[1], nq = dst->ne[1], r = cells->ne[0];
+    std::vector<float> computed(queries ? nb : 0);
+    const int k = ggml_get_op_params_i32(dst, 0), words = (nb + 31)/32;
+    auto * order = (int32_t *) params->wdata + (size_t) params->ith*nb;
+    for (int64_t row = params->ith; row < dst->ne[1]*dst->ne[3]; row += params->nth) {
+        const float * score = queries ? computed.data() : (const float *) scores->data + row*nb;
+        if (queries) {
+            const int d = queries->ne[0], heads = queries->ne[1];
+            const auto * q = (const float *) queries->data + row*heads*d;
+            const auto * keys = (const float *) ((const char *) scores->data + (row/nq)*scores->nb[2]);
+            for (int b = 0; b < nb; ++b) {
+                float sum = 0.0f;
+                for (int h = 0; h < heads; ++h) {
+                    float dot = 0.0f;
+                    for (int c = 0; c < d; ++c) { dot += keys[b*d + c]*q[h*d + c]; }
+                    sum += std::max(dot, 0.0f);
+                }
+                computed[b] = sum;
+            }
+        }
+        const uint32_t * bits = (const uint32_t *) dst->src[2]->data + row*words;
+        int count = 0;
+        for (int b = 0; b < nb; ++b) {
+            if ((bits[b/32] & (uint32_t(1) << (b%32))) && std::isfinite(score[b])) {
+                order[count++] = b;
+            }
+        }
+        const int take = std::min(count, k);
+        const auto cmp = [&](int a, int b) { return score[a] > score[b] || (score[a] == score[b] && a < b); };
+        std::partial_sort(order, order + take, order + count, cmp);
+        auto * out = (int32_t *) dst->data + row*dst->ne[0];
+        std::fill(out, out + dst->ne[0], -1);
+        const auto * members = (const int32_t *) cells->data + (row/nq)*nb*r;
+        for (int i = 0; i < take; ++i) {
+            std::copy_n(members + order[i]*r, r, out + i*r);
+        }
+        const auto * tail = (const int32_t *) dst->src[3]->data + row*(r - 1);
+        std::copy_n(tail, r - 1, out + k*r);
+    }
+}
+
+template<bool kv_q8>
+static inline float ggml_qsa_value(const char * row, int c) {
+    if constexpr (kv_q8) {
+        const auto & block = ((const block_q8_0 *) row)[c/QK8_0];
+        return GGML_FP16_TO_FP32(block.d)*block.qs[c%QK8_0];
+    } else {
+        return GGML_FP16_TO_FP32(((const ggml_fp16_t *) row)[c]);
+    }
+}
+
+template<bool kv_q8>
+static void ggml_compute_forward_qsa_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    const auto * indices = dst->src[5];
+    const int d = q->ne[0], dv = v->ne[0], nq = q->ne[1], nh = q->ne[2];
+    const int gqa = nh/k->ne[2], width = indices->ne[0];
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    for (int64_t row = params->ith; row < nq*nh*q->ne[3]; row += params->nth) {
+        const int h = row%nh, t = (row/nh)%nq, s = row/(nh*nq);
+        const float * query = (const float *) ((const char *) q->data + t*q->nb[1] + h*q->nb[2] + s*q->nb[3]);
+        const auto * ids = (const int32_t *) indices->data + (s*nq + t)*width;
+        float * out = (float *) dst->data + row*dv;
+        std::fill(out, out + dv, 0.0f);
+        float mx = -INFINITY, den = 0.0f;
+        for (int j = 0; j < width; ++j) {
+            const int cell = ids[j];
+            if (cell < 0) { continue; }
+            GGML_ASSERT(cell < k->ne[1]);
+            const auto * key = (const char *) k->data + cell*k->nb[1] + (h/gqa)*k->nb[2] + s*k->nb[3];
+            const auto * val = (const char *) v->data + cell*v->nb[1] + (h/gqa)*v->nb[2] + s*v->nb[3];
+            float dot = 0.0f;
+            for (int c = 0; c < d; ++c) { dot += query[c]*ggml_qsa_value<kv_q8>(key, c); }
+            dot *= scale;
+            const float next = std::max(mx, dot), alpha = std::exp(mx - next), weight = std::exp(dot - next);
+            for (int c = 0; c < dv; ++c) { out[c] = out[c]*alpha + weight*ggml_qsa_value<kv_q8>(val, c); }
+            den = den*alpha + weight;
+            mx = next;
+        }
+        if (den > 0) { for (int c = 0; c < dv; ++c) { out[c] /= den; } }
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[5]) {
+        if (dst->src[1]->type == GGML_TYPE_Q8_0) {
+            ggml_compute_forward_qsa_attn<true>(params, dst);
+        } else {
+            ggml_compute_forward_qsa_attn<false>(params, dst);
+        }
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

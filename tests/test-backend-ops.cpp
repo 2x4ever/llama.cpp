@@ -6492,6 +6492,60 @@ struct test_argsort : public test_case {
     }
 };
 
+// GGML_OP_QSA_SELECT
+struct test_qsa_select : public test_case {
+    const int64_t n_blocks;
+    const bool indexer;
+
+    test_qsa_select(int64_t n_blocks, bool indexer) : n_blocks(n_blocks), indexer(indexer) {}
+
+    std::string vars() override { return VARS_TO_STR2(n_blocks, indexer); }
+    double max_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_blocks, 2);
+        auto * visible = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, (n_blocks + 31)/32, 35, 2);
+        auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 3, 35, 2);
+        ggml_set_name(cells, "cells");
+        ggml_set_name(visible, "visible");
+        ggml_set_name(tail, "tail");
+        if (indexer) {
+            auto * keys = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, n_blocks + 3, 2);
+            ggml_set_name(keys, "keys");
+            keys = ggml_view_3d(ctx, keys, 8, n_blocks, 2, keys->nb[1], keys->nb[2], 0);
+            auto * queries = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 8, 2, 35, 2);
+            ggml_set_name(queries, "queries");
+            return ggml_qsa_indexer(ctx, keys, queries, cells, visible, tail, 17);
+        }
+        auto * scores = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 35, 2);
+        ggml_set_name(scores, "scores");
+        return ggml_qsa_select(ctx, scores, cells, visible, tail, 17);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) { continue; }
+            const std::string name = t->name;
+            if (name == "keys" || name == "queries" || name == "scores") {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = name == "queries" ? 1.0f : name == "keys" ? float((i/8)%(n_blocks + 3) + 1)/16 : float(i%n_blocks + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (name == "cells" || name == "visible" || name == "tail") {
+                std::vector<int32_t> data(ggml_nelements(t), -1);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    if (name == "cells") { data[i] = (4*n_blocks - 1 - i%(4*n_blocks)); }
+                    if (name == "visible") { data[i] = (i/t->ne[0])%7 == 6 ? 0 : 0x55555555; }
+                    if (name == "tail" && i%3 == 0) { data[i] = 4*n_blocks; }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -7690,9 +7744,10 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool compact_mask;
+    const int64_t n_indices;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) + ",compact_mask=" + std::to_string(compact_mask);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) + ",compact_mask=" + std::to_string(compact_mask) + "," + VAR_TO_STR(n_indices);
     }
 
     double max_nmse_err() override {
@@ -7709,9 +7764,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool compact_mask = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool compact_mask = false, int64_t n_indices = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), compact_mask(compact_mask) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), compact_mask(compact_mask), n_indices(n_indices) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7773,6 +7828,11 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
+        if (n_indices) {
+            ggml_tensor * indices = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_indices, nb, 1, nr23[1]);
+            ggml_set_name(indices, "indices");
+            ggml_flash_attn_ext_set_indices(out, indices);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -7780,7 +7840,21 @@ struct test_flash_attn_ext : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "s") == 0) {
+            if (strcmp(t->name, "indices") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t), -1), cells(kv);
+                std::iota(cells.begin(), cells.end(), 0);
+                std::mt19937 rng(8341);
+                for (int64_t row = 0; row < nb*nr23[1]; ++row) {
+                    std::shuffle(cells.begin(), cells.end(), rng);
+                    const int64_t count = row%7 == 6 ? 0 : std::min(n_indices, kv) - row%3;
+                    for (int64_t j = 0; j < count; ++j) { data[row*n_indices + j] = cells[j]; }
+                    if (row%7 == 5) {
+                        std::fill_n(data.begin() + row*n_indices, n_indices, -1);
+                        data[(row + 1)*n_indices - 1] = cells[0];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
@@ -10723,6 +10797,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t n_blocks : {33, 4097}) {
+        for (bool indexer : {false, true}) {
+            test_cases.emplace_back(new test_qsa_select(n_blocks, indexer));
+        }
+    }
+
     // Compact causal masks: holes, shared prefixes, mixed sequences and M-RoPE ties.
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int64_t nq : {1, 2, 7, 65, 1024}) {
@@ -10731,6 +10811,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {1, 2}, 512, 65, true, true, 0, 10, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 0, true));
+    }
+
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 9}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 4096, nb, false, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, 0, false, 2051));
+        }
     }
 
     // mixed quant and Q1_0 test cases

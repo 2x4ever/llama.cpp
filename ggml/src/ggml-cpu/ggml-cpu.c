@@ -2006,6 +2006,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argsort(params, tensor);
             } break;
+        case GGML_OP_QSA_SELECT:
+            {
+                ggml_compute_forward_qsa_select(params, tensor);
+            } break;
         case GGML_OP_TOP_K:
             {
                 ggml_compute_forward_top_k(params, tensor);
@@ -2022,6 +2026,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_fill(params, tensor);
             } break;
+        case GGML_OP_QSA_ATTN:
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2421,6 +2426,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_QSA_SELECT:
+        case GGML_OP_QSA_ATTN:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
@@ -2980,10 +2987,15 @@ struct ggml_cplan ggml_graph_plan(
                         cur += ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12 * ne13;
 
                     } break;
+                case GGML_OP_QSA_SELECT:
+                    {
+                        cur += sizeof(int32_t)*node->src[1]->ne[1]*n_tasks;
+                    } break;
                 case GGML_OP_TOP_K:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
+                case GGML_OP_QSA_ATTN:
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
