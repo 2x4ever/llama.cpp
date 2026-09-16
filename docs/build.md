@@ -286,6 +286,8 @@ Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
 
+This variable does not enable unified memory for HIP devices. Unset it to disable this option; any value, including `0`, enables it.
+
 ### Peer Access
 
 The environment variable `GGML_CUDA_P2P` can be set to enable peer-to-peer access between multiple GPUs, allowing them to transfer data directly rather than to go through system memory.
@@ -398,7 +400,9 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 ### Unified Memory
 
-On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
+On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_HIP_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
+
+HIP and CUDA use independent switches. Existing HIP launch commands that use `GGML_CUDA_ENABLE_UNIFIED_MEMORY` must use `GGML_HIP_ENABLE_UNIFIED_MEMORY` instead. In a process using both backends, set only the switch for the backend that needs unified memory, or set both to enable it for both backends. Unset a switch to disable it; any value, including `0`, enables it.
 
 ## Vulkan
 
