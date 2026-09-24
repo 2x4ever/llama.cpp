@@ -347,7 +347,19 @@ The supported architectures are `qwen35` and `qwen4exp`. For Qwen4Exp, enable na
 
 `-ub` sets the main context's physical batch limit and the default worker limit. `LLAMA_PIPELINE_UBATCH` can override the worker limit, up to `-b`. Each context retains its own graph and output buffers, while the pool reuses device scratch between GPU stages. More workers can increase host memory and private buffer usage. Throughput depends on stage balance, microbatch size, and the number of active requests.
 
-For supported Qwen targets, single-head `--spec-type draft-mtp` also uses independent decode lanes when at least two requests are generating. Each lane runs draft, target verification, and draft catch-up with its own contexts and speculative state. Draft contexts share weights, unified KV, and device scratch; access to the shared draft context memory is serialized. Target stages can overlap with other lanes and with draft work. The target rollback depth must cover `--spec-draft-n-max`, the draft must support partial sequence removal, and the worker ubatch must exceed the rollback depth plus one. The log prints `MTP pipeline lane ... active` when a lane first runs. Chained MTP heads, shared target/draft memory, and other speculative methods use the ordinary server decode path.
+For supported Qwen targets, single-head `--spec-type draft-mtp` also uses independent decode lanes when at least two requests are generating. Each lane runs draft, target verification, and draft catch-up with its own contexts and speculative state. Draft contexts share weights and unified KV. Target stages can overlap with other lanes and with draft work. The target rollback depth must cover `--spec-draft-n-max`, the draft must support partial sequence removal, and the worker ubatch must exceed the rollback depth plus one. The log prints `MTP pipeline lane ... active` when a lane first runs. Chained MTP heads, shared target/draft memory, and other speculative methods use the ordinary server decode path.
+
+MTP draft execution has three modes:
+
+| Setting | Draft execution | Device scratch |
+| --- | --- | --- |
+| `LLAMA_PIPELINE_MTP_BATCH=1` | Combine already-ready draft and catch-up steps; no coalescing delay | Shared |
+| Default, or `LLAMA_PIPELINE_MTP_BATCH=0` | Serialize draft calls from individual lanes | Shared |
+| `LLAMA_PIPELINE_MTP_CONCURRENT=1` | Execute draft calls on separate lane contexts and backend streams | Private per lane |
+
+Concurrent mode takes precedence over batching. It holds the shared KV mutex while reserving cells and preparing graph inputs, then releases it before graph execution. Each draft call must fit one physical microbatch; the server sizes these contexts for short speculative steps. Weights and KV are not duplicated, but private scratch increases VRAM usage. Moving the draft to a separate device with `-devd` can reduce contention with target verification. Actual overlap and throughput depend on backend support, device capacity, and workload; CUDA execution is tested.
+
+The batching log prints `MTP ready-step batching enabled` and reports the first actual merge as `MTP batcher merged`. Concurrent mode prints `MTP concurrent draft lane ... enabled` and its private compute allocations. These modes apply only to independent MTP decode lanes; ordinary prefill and single-request speculative decoding keep their existing paths.
 
 Single-request speculative verification and operations requiring ordinary embeddings, backend sampling on the target, LoRA, evaluation/abort callbacks, or noncausal attention use the main context after draining worker work. MTP hidden states follow the input token order across prefill partitions, and pending hidden states move with requests when the server enters or leaves independent decode lanes. New requests and cancellation drain the lanes before the main loop handles them. `LLAMA_PIPELINE_STREAM=0` disables independent server decode lanes while keeping worker prefill enabled. Unset `LLAMA_PIPELINE_WORKERS` to use the ordinary scheduler.
 

@@ -51,7 +51,7 @@ struct llama_context {
     ~llama_context();
 
     // Create and change shared contexts only while all workers are idle.
-    std::unique_ptr<llama_context> create_shared(uint32_t n_batch, uint32_t n_ubatch);
+    std::unique_ptr<llama_context> create_shared(uint32_t n_batch, uint32_t n_ubatch, bool concurrent = false);
     void set_pipeline(uint32_t n_workers, uint32_t n_ubatch);
     uint32_t pipeline_n_workers() const;
     uint32_t pipeline_n_ubatch() const;
@@ -294,7 +294,7 @@ private:
     // members
     //
 
-    llama_context(const llama_model & model, llama_context_params params, llama_context * source);
+    llama_context(const llama_model & model, llama_context_params params, llama_context * source, bool concurrent = false);
     int decode_impl(const llama_batch & batch_inp);
     int decode_pipeline(const llama_batch & batch_inp);
     friend struct llama_context_pipeline;
@@ -311,6 +311,7 @@ private:
 
     std::shared_ptr<llama_memory_i> memory;
     std::shared_ptr<ggml_backend_workspace_pool> shared_workspace;
+    bool concurrent_draft = false;
     std::shared_ptr<std::mutex> memory_mutex = std::make_shared<std::mutex>();
     std::unique_ptr<llama_context_pipeline> pipeline;
     llama_context_pipeline * pipeline_lane = nullptr;

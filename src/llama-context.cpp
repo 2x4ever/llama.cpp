@@ -8,6 +8,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -252,7 +253,7 @@ llama_context::llama_context(
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
-              llama_context * source) :
+              llama_context * source, bool concurrent) :
     model(model),
     params_init(params),
     cvec(source ? source->cvec : std::make_shared<llama_adapter_cvec>()),
@@ -566,8 +567,13 @@ llama_context::llama_context(
         if (source) {
             memory = source->memory;
             memory_mutex = source->memory_mutex;
-            shared_workspace = source->shared_workspace;
-            if (source->pipeline && source->pipeline->workspace) { pipeline_lane = source->pipeline.get(); }
+            concurrent_draft = concurrent;
+            if (concurrent) {
+                shared_workspace.reset(ggml_backend_workspace_pool_new(), ggml_backend_workspace_pool_free);
+            } else {
+                shared_workspace = source->shared_workspace;
+                if (source->pipeline && source->pipeline->workspace) { pipeline_lane = source->pipeline.get(); }
+            }
         } else {
             memory.reset(model.create_memory(params_mem, cparams));
         }
@@ -705,7 +711,7 @@ llama_context::llama_context(
     }
 }
 
-std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, uint32_t n_ubatch) {
+std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, uint32_t n_ubatch, bool concurrent) {
     const bool mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
     if ((model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_QWEN35) || !cparams.kv_unified || !memory ||
             (!mtp && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !sampling.samplers.empty())) || !loras->empty() || opt_ctx) {
@@ -714,8 +720,15 @@ std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, ui
     if (n_batch == 0 || n_ubatch == 0 || n_ubatch > n_batch) {
         throw std::invalid_argument("invalid shared context batch sizes");
     }
+    if (concurrent && (!mtp || n_batch != n_ubatch || !dynamic_cast<llama_kv_cache *>(memory.get()))) {
+        throw std::invalid_argument("concurrent shared execution requires a dense MTP KV cache and n_batch == n_ubatch");
+    }
     synchronize();
-    if (mtp && !shared_workspace) {
+    if (concurrent) {
+        memory_update(false);
+        synchronize();
+    }
+    if (mtp && !concurrent && !shared_workspace) {
         shared_workspace.reset(ggml_backend_workspace_pool_new(), ggml_backend_workspace_pool_free);
         sched_need_reserve = true;
         sched_reserve();
@@ -728,13 +741,13 @@ std::unique_ptr<llama_context> llama_context::create_shared(uint32_t n_batch, ui
     params.n_ubatch = n_ubatch;
     params.samplers = nullptr;
     params.n_samplers = 0;
-    auto result = std::unique_ptr<llama_context>(new llama_context(model, params, this));
+    auto result = std::unique_ptr<llama_context>(new llama_context(model, params, this, concurrent));
     result->set_embeddings_nextn(cparams.embeddings_nextn, cparams.embeddings_nextn_masked);
     return result;
 }
 
-llama_context * llama_context_create_shared(llama_context * ctx, uint32_t n_batch, uint32_t n_ubatch) {
-    return ctx->create_shared(n_batch, n_ubatch).release();
+llama_context * llama_context_create_shared(llama_context * ctx, uint32_t n_batch, uint32_t n_ubatch, bool concurrent) {
+    return ctx->create_shared(n_batch, n_ubatch, concurrent).release();
 }
 
 bool llama_context::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1134,7 +1147,10 @@ void llama_context::sched_reserve() {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            if (workspace) {
+            if (concurrent_draft) {
+                LLAMA_LOG_INFO("%s: %10s private concurrent draft compute buffer = %8.2f MiB\n", __func__,
+                        ggml_backend_buft_name(buft), backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            } else if (workspace) {
                 const size_t private_size = ggml_backend_sched_get_private_buffer_size(sched.get(), backend);
                 LLAMA_LOG_INFO("%s: %10s compute buffers: private = %8.2f MiB, shared = %8.2f MiB\n", __func__,
                         ggml_backend_buft_name(buft), private_size / 1024.0 / 1024.0, (backend_buf_exp_size[i] - private_size) / 1024.0 / 1024.0);
@@ -1872,6 +1888,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             pipeline_lane->prepare_cv.notify_all();
         }
         pipeline_lock->unlock();
+    } else if (concurrent_draft) {
+        // KV cells are committed and graph inputs are private. Other sequences can now prepare.
+        GGML_ASSERT(pipeline_lock && pipeline_lock->owns_lock());
+        pipeline_lock->unlock();
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2126,6 +2146,27 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (concurrent_draft) {
+        // init_batch only plans future ubatches; do not release uncommitted reservations.
+        if (batch_inp.n_tokens > int32_t(cparams.n_ubatch) || !batch_inp.seq_id || !batch_inp.pos) { return -1; }
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (!batch_inp.seq_id[i] || (batch_inp.n_seq_id && batch_inp.n_seq_id[i] != 1)) { return -1; }
+        }
+        std::unique_lock<std::mutex> lock(*memory_mutex);
+        pipeline_lock = &lock;
+        try {
+            const int ret = decode_impl(batch_inp);
+            if (lock.owns_lock()) { lock.unlock(); }
+            synchronize();
+            pipeline_lock = nullptr;
+            return ret;
+        } catch (...) {
+            if (lock.owns_lock()) { lock.unlock(); }
+            synchronize();
+            pipeline_lock = nullptr;
+            throw;
+        }
+    }
     if (pipeline_lane) {
         std::unique_lock<std::mutex> lock(*memory_mutex);
         pipeline_lane->prepare_cv.wait(lock, [&] { return pipeline_lane->failed || pipeline_lane->next_ticket == pipeline_ticket; });
@@ -2392,7 +2433,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    if (!pipeline_lane) { memory_update(false); }
+    if (!pipeline_lane && !concurrent_draft) { memory_update(false); }
 
     llama_memory_context_ptr mctx;
 
@@ -2414,7 +2455,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize && !pipeline_lane) {
+                    if (!did_optimize && !pipeline_lane && !concurrent_draft) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -2477,6 +2518,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (concurrent_draft) { synchronize(); }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -4041,6 +4083,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += ggml_backend_sched_get_private_buffer_size(sched.get(), backend);
             if (pipeline && pipeline->workspace) {
                 ret[buft].compute += ggml_backend_workspace_pool_get_buffer_size(pipeline->workspace.get(), buft);
+            }
+            if (concurrent_draft) {
+                ret[buft].compute += ggml_backend_workspace_pool_get_buffer_size(shared_workspace.get(), buft);
             }
         }
     }
