@@ -1,5 +1,15 @@
 # Instructions for llama.cpp
 
+## Fork maintenance requirements
+
+This checkout contains the 2x4ever fork. Before changing it or rebasing onto upstream, read [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) and [docs/fork/CHANGES.md](docs/fork/CHANGES.md).
+
+- Document every difference from upstream as an identifiable entry in `docs/fork/CHANGES.md`, including fixes, features, build/protocol changes and documentation policy. Update the entry in the same commit as the change, with behavior, limits, source locations, dependencies, validation and upstream status.
+- During each rebase or upstream merge, review every active entry against the exact new upstream revision. Check semantics and regression coverage before treating a similarly named upstream fix or feature as equivalent.
+- When upstream fully replaces a local change, remove the duplicate implementation where appropriate, mark the entry `upstream`, and record the upstream commit and validation. For partial coverage, record the remaining delta. For removal without replacement, use `retired` and explain why. Update obsolete options, limitations and performance claims; retain a short historical entry so removed patches are not reintroduced.
+- Keep `FORK-MAINTENANCE.md`, the change inventory and `docs/fork/VALIDATION.md` consistent. Distinguish current tests from historical results, source-only checks and untested hardware. A clean rebase or successful build alone is not sufficient validation.
+- Do not use old experimental worktrees, unmerged branches or archived launchers as the source of current behavior. Preserve unique uncommitted work and raw evidence during cleanup. Keep unmerged features separate from the main fork update.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.

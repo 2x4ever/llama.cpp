@@ -1,5 +1,7 @@
 # llama.cpp
 
+This is the 2x4ever fork. See [fork differences](docs/fork/CHANGES.md), [maintenance and rebase instructions](FORK-MAINTENANCE.md), and the [validation record](docs/fork/VALIDATION.md).
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
