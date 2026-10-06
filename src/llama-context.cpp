@@ -8,6 +8,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1898,7 +1899,13 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::bad_alloc &) {
+            LLAMA_LOG_ERROR("%s: allocation failed while building graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2547,6 +2554,15 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
         }
 
         ggml_status status;
+
+        // Keep cached positions intact if fallback allocation fails before apply.
+        if (auto * idx = dynamic_cast<llama_memory_hybrid_idx_context *>(mctx.get())) {
+            try {
+                idx->prepare_qsa_fallback(ubatch, cparams.flash_attn && cparams.causal_attn && !model.hparams.use_alibi && !model.hparams.attn_soft_cap);
+            } catch (const std::bad_alloc &) {
+                return -2;
+            }
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
@@ -3219,7 +3235,14 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (const std::bad_alloc &) {
+        this->n_outputs = save_n_outputs;
+        LLAMA_LOG_ERROR("%s: allocation failed while building graph\n", __func__);
+        return nullptr;
+    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;

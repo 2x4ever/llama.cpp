@@ -2,6 +2,36 @@
 
 This record separates current validation from historical evidence. Reproducible repository test entry points are in [FORK-MAINTENANCE.md](../../FORK-MAINTENANCE.md). Raw artifacts live outside the source tree; exact locations and hashes are recorded per validation date.
 
+## Compact Native QSA storage: 2026-10-06
+
+This refinement follows the rebase below. Its baseline is `c94c992b9b4a7b40ba0b22d9db19d437844d16c9` (the following `76e2b86c7` commit changes documentation only), not stock upstream. Native-enabled compatible Qwen4Exp contexts retain raw-only F16 indexer rows and the compact F32 pooled cache. The upstream fallback gets separate per-layer pooled storage on first use. No selection or attention arithmetic changes.
+
+On Flash-Next UD-Q4_K_XL, four RTX 3090s, Q8_0 main KV, native QSA, context 500000, batch 2048, microbatch 512 and no managed memory, the per-GPU per-token indexer allocation falls from 732.75 MiB to 366.38 MiB. This saves 1465.5 MiB across four GPUs. The sampled peak on the fullest card falls from 23470 to 23104 MiB. Compute reservations are 304.30 MiB on CUDA0 and 424.30 MiB on CUDA1-3; CUDA_Host is 113.57 MiB. The 500K case validates startup/reservation, not processing a 500K prompt.
+
+Throughput comparison uses the same real model on those four GPUs, context 131072, Q8_0 main KV, `-b 2048 -ub 512 -np 4`, eight CPU threads, native QSA, no CPU pipeline workers, UM or vision, and two fresh-prompt repetitions per depth. Values are mean server tokens/s; decode generates 128 tokens. Changes this small are not evidence of a speedup.
+
+| Workload | Packed native storage | Compact native storage |
+| --- | ---: | ---: |
+| Prefill 8192 | 1093.31 | 1091.61 |
+| Decode after 8192 | 62.36 | 62.98 |
+| Prefill 65536 | 984.27 | 985.36 |
+| Decode after 65536 | 58.84 | 58.80 |
+
+The four generated text responses match the baseline. A later error-path-only adjustment moves fallback allocation preflight out of the generic rollback path; this does not change the successful graph. Targeted failure tests and the real five-worker lifecycle test were rerun after that adjustment. The exact final source patch and binary hashes are retained with the evidence.
+
+Validation:
+
+- ARM64 CPU/Accelerate and CUDA 12.9 sm86 server and relevant tests build. Final ARM CTest sampling, batch allocation, arguments, allocation and RPC checks pass 5/5. F16/Q8 synthetic text/spatial/text transitions, including saved spatial state restored into a fresh context, have bitwise-identical logits to the frozen packed-storage baseline on the same backend. Native-off and unsupported F32 CPU rollback cases pass. F16/Q8 recurrent rollback, split replay and shared-prefix tests pass on CPU and CUDA.
+- Lazy allocation, eight concurrent acquisitions sharing one tensor, and zero-byte placeholders for no-alloc fitting pass. Switching causal attention off and back on rebuilds the derived cache; fresh-context restore and retry after allocation failure agree with uninterrupted execution on CPU.
+- Fault injection fails the first or second fallback-layer allocation. Decode returns -2, preserves old positions and succeeds on retry. A spatial batch starting at the already cached last position with four recurrent rollback snapshots previously deleted that position during error cleanup; the final preflight bypasses this cleanup. F16/Q8 overlap, overlap-plus-restore and non-causal fault cases pass on ARM and CUDA. CUDA Compute Sanitizer memcheck of overlap/failure/retry/restore reports zero errors.
+- The divergent shared-prefix overcapacity branch passes on CUDA. Real Flash-Next pipeline tests pass with two workers/F16 and five workers/Q8. Prefill, all-output prefill, decode replay, failure/drain/reuse and duplicate-sequence rejection have max_abs=0 in compared outputs. The final five-worker run was repeated after the last error-path fix.
+
+Failure history is retained: one real-model attempt failed while allocating model weights before context construction, then passed on retry without a code change. An initial second-layer fault test did not inject failure because its hook covered one backend buffer type while layers were split across devices; the corrected test places both indexer layers on one GPU. These setup/load failures are not counted as passing tests.
+
+Limitations: fallback storage stays allocated until its shared memory object is destroyed, to keep cached graph pointers valid. A context that uses spatial or non-causal fallback therefore regains the extra reservation; dense fallback masks can also cost memory. Spatial coverage uses generated embeddings, not a real vision tower. The native serialized indexer row width changes, so old packed-native snapshots must be regenerated. No new PPL run, reference-model quality comparison, HIP/Vulkan/P40/V100 execution, or mixed-backend model run was performed for this storage refinement.
+
+Raw evidence is in `investigations/upstream-rebase-2026-10-06/compact-indexer` locally and `/home/user/fork-rebase-20261006/compact-indexer` on `user@192.168.50.53`. Start with `RESULTS.md`; `final-code.patch`, `source-hashes-final.json`, `final-binary-hashes.json`, test runners, result JSON and logs identify the measured code and commands. A portable `compact-indexer-validation.tar.gz` and adjacent SHA256 are stored in the parent directory on both hosts. The original server remains stopped.
+
 ## Upstream rebase and Native QSA adaptation: 2026-10-06
 
 | Role | Commit |

@@ -59,6 +59,8 @@ git diff --check
 
 `range-diff` reviews the replayed patches; also inspect the merge topology and final tree. Counts need not stay constant when upstream absorbs a change. Keep the backup and record dropped/adapted commits. Update the baseline in this guide and CHANGES.md, and record the exact tested candidate in VALIDATION.md. Rebase unmerged feature branches separately, after validating the main branch. Publication is a separate action; this procedure does not push or merge anything.
 
+For Native QSA storage changes, also check raw-only allocation, text/spatial/text fallback, saved-state restoration and the lifetime of shared worker graphs. Text-only native execution must not allocate the separate upstream fallback pooled buffer. Once used, that buffer remains alive with the memory object.
+
 ## Build and loaded-library checks
 
 Use a new build directory so incompatible cached toolchain options cannot silently survive a rebase. Build all backends that the resulting binary will advertise. Include RPC in compile checks whenever ggml operation IDs change.

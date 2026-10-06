@@ -6,6 +6,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 struct llama_qsa_batch {
@@ -123,10 +124,12 @@ public:
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
     bool qsa_enabled() const { return !qsa_caches.empty(); }
     void invalidate_qsa();
+    bool qsa_can_use_native(const llama_ubatch & ubatch) const;
     void prepare_qsa(const llama_kv_cache::slot_info & sinfo, const llama_ubatch & ubatch,
-                     int64_t n_kv, std::map<uint32_t, llama_qsa_batch> & batches);
+                     int64_t n_kv, std::map<uint32_t, llama_qsa_batch> & batches, bool native_attn);
     void reserve_qsa(std::map<uint32_t, llama_qsa_batch> & batches) const;
     ggml_tensor * get_qsa_keys(int32_t il) const;
+    ggml_tensor * get_qsa_fallback_keys(int32_t il) const;
     void set_qsa_inputs(uint32_t ratio, const llama_qsa_batch & batch, const llama_ubatch & ubatch,
                         ggml_tensor * cells, ggml_tensor * visible, ggml_tensor * tail,
                         ggml_tensor * update_cells, ggml_tensor * update_pos, ggml_tensor * update_ids) const;
@@ -159,6 +162,9 @@ private:
         ggml_tensor * keys = nullptr;
     };
     std::map<int32_t, qsa_cache> qsa_caches;
+    mutable std::map<int32_t, qsa_cache> qsa_fallback_caches;
+    mutable std::mutex qsa_fallback_mutex;
+    bool qsa_no_alloc = false;
     std::map<uint32_t, std::vector<llama_qsa_layout>> qsa_layouts;
 };
 
@@ -173,7 +179,7 @@ public:
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * separate_pooled);
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;
@@ -230,6 +236,7 @@ public:
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
     bool qsa_enabled() const { return mem && mem->qsa_enabled(); }
+    void prepare_qsa_fallback(const llama_ubatch & ubatch, bool native_attn);
     const llama_qsa_batch & get_qsa(uint32_t ratio) const { return qsa_batches.at(ratio); }
     ggml_tensor * get_qsa_keys(int32_t il) const { return mem->get_qsa_keys(il); }
     ggml_tensor * get_qsa_raw(int32_t il) const { return mem->get_mem_idx()->get_k_storage(il); }
@@ -252,6 +259,7 @@ private:
     const slot_info_vec_t sinfos_kpool;
     const slot_info_vec_t sinfos_qsa;
     std::map<uint32_t, llama_qsa_batch> qsa_batches;
+    bool qsa_native_attn = true;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;

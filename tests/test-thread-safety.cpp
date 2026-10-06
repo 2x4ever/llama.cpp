@@ -13,6 +13,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid-idx.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -57,6 +58,12 @@ static int test_pipeline(int argc, char ** argv, bool mtp = false) {
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     llama_context_ptr owner(llama_init_from_model(model, cp));
     pipeline_require(bool(owner), "context");
+    auto * idx_mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(owner.get()));
+    if (idx_mem && idx_mem->qsa_enabled()) {
+        for (int il : idx_mem->get_mem_idx()->get_layer_ids()) {
+            pipeline_require(idx_mem->get_mem_idx()->get_k_storage(il)->ne[0] == idx_mem->get_qsa_keys(il)->ne[0], "native indexer stores only raw keys");
+        }
+    }
     std::string text;
     for (int i = 0; i < 1024; ++i) { text += "Pipeline validation paragraph " + std::to_string(i) + ": the river flows through the valley. Calculate 123 + 456 and explain the result.\n"; }
     auto tokens = common_tokenize(llama_model_get_vocab(model), text, true, false);
