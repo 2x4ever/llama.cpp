@@ -4062,6 +4062,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            if (i + 3 < cgraph->n_nodes && ggml_cuda_should_fuse_mmq_moe_down(up, glu, cgraph->nodes[i + 3])) {
+                const ggml_op ops[] = { op, op, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+                const int output = i + 3;
+                if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, &output, 1) &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1)) {
+                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, gate->src[0], cgraph->nodes[output]);
+                    fused_mul_mat_vec = true;
+                    fused_node_count = 4;
+                    break;
+                }
+            }
+            if (ggml_cuda_should_fuse_mmq_moe(up, glu)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, gate->src[0]);
+                fused_mul_mat_vec = true;
+                fused_node_count = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
@@ -4640,6 +4658,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+            const int output = i + 2;
+            if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, &output, 1) &&
+                    ggml_cuda_should_fuse_mul_mat(cgraph->nodes[i + 1], cgraph->nodes[i], cgraph->nodes[output]) &&
+                    ggml_cuda_should_fuse_mmq_moe(cgraph->nodes[i + 1], cgraph->nodes[output], false)) {
+                const int output_down = i + 3;
+                const ggml_op ops_down[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+                if (output_down < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, 4, ops_down, &output_down, 1) &&
+                        ggml_cuda_should_fuse_mmq_moe_down(cgraph->nodes[i + 1], cgraph->nodes[output], cgraph->nodes[output_down], false)) {
+                    add_alloc_deps(i, output_down);
+                } else {
+                    add_alloc_deps(i, output);
+                }
+            }
+        }
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
