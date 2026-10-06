@@ -5,6 +5,42 @@
 
 #include <cstdint>
 
+static __global__ void mmq_moe_tiles(const int32_t * bounds, int2 * tiles_small, int2 * tiles_large, int32_t * counts,
+        const int n_experts, const int tile_small, const int tile_large, const int limit_small) {
+    extern __shared__ int offsets[];
+    int * small = offsets;
+    int * large = offsets + blockDim.x;
+    const int e = threadIdx.x;
+    const int first = e < n_experts ? bounds[e] : 0;
+    const int n = e < n_experts ? bounds[e + 1] - first : 0;
+    int ns = n <= limit_small ? (n + tile_small - 1) / tile_small : 0;
+    int nl = n >  limit_small ? (n + tile_large - 1) / tile_large : 0;
+    const int own_small = ns;
+    const int own_large = nl;
+    small[e] = ns;
+    large[e] = nl;
+    __syncthreads();
+
+    for (int step = 1; step < int(blockDim.x); step *= 2) {
+        const int ps = e >= step ? small[e - step] : 0;
+        const int pl = e >= step ? large[e - step] : 0;
+        __syncthreads();
+        small[e] = ns += ps;
+        large[e] = nl += pl;
+        __syncthreads();
+    }
+    if (e == int(blockDim.x) - 1) {
+        counts[0] = ns;
+        counts[1] = nl;
+    }
+    for (int j = 0; j < own_small; ++j) {
+        tiles_small[ns - own_small + j] = make_int2(e, first + j*tile_small);
+    }
+    for (int j = 0; j < own_large; ++j) {
+        tiles_large[nl - own_large + j] = make_int2(e, first + j*tile_large);
+    }
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -306,13 +342,57 @@ void ggml_cuda_mul_mat_q(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+
+    static const bool compact_moe = [] {
+        const char * value = getenv("GGML_CUDA_MMQ_MOE_COMPACT");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    if (compact_moe && ampere_mma_available(cc) && !fallback &&
+            ne02 >= 64 && ne02 <= 1024 && ne12 >= 128 && ne12 <= 16384 && ne03 == 1 &&
+            (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0)) {
+        constexpr int tile_small = 16;
+        constexpr int tile_large = 128;
+        constexpr int limit_small = 16;
+        const auto config_small = ggml_cuda_mmq_get_config(src0->type, tile_small, false, cc);
+        const auto config_large = ggml_cuda_mmq_get_config(src0->type, tile_large, false, cc);
+        const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+        if (config_small.type == GGML_TYPE_COUNT || config_large.type == GGML_TYPE_COUNT ||
+                mmq_get_nbytes_shared(config_small, cc) > smpbo || mmq_get_nbytes_shared(config_large, cc) > smpbo) {
+            ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+            return;
+        }
+        // Each small expert contributes at most one tile.
+        const int64_t max_small = std::min(ne02, ne_get_rows);
+        const int64_t max_large = ne02 + ne_get_rows/tile_large;
+        ggml_cuda_pool_alloc<int2> tiles(ctx.pool(), max_small + max_large);
+        ggml_cuda_pool_alloc<int32_t> counts(ctx.pool(), 2);
+        int nthreads = 1;
+        while (nthreads < ne02) {
+            nthreads *= 2;
+        }
+        mmq_moe_tiles<<<1, nthreads, 2*nthreads*sizeof(int), stream>>>(expert_bounds.get(), tiles.get(),
+                tiles.get() + max_small, counts.get(), ne02, tile_small, tile_large, limit_small);
+        CUDA_CHECK(cudaGetLastError());
+
+        args.expert_tiles = tiles.get();
+        args.expert_tile_count = counts.get();
+        args.expert_tiles_max = max_small;
+        args.ncols_opt = tile_small;
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        args.expert_tiles = tiles.get() + max_small;
+        args.expert_tile_count = counts.get() + 1;
+        args.expert_tiles_max = max_large;
+        args.ncols_opt = tile_large;
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        return;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

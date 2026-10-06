@@ -175,3 +175,33 @@ At `b54151e`, RPC count/version assertions were corrected for QSA. `GGML_RPC=ON`
 ## Recording the next validation
 
 Append the exact old/new fork and upstream revisions, change IDs, toolchain/device/model/corpus hashes, commands, passed and skipped cases, peak-memory and throughput results, and an accessible raw-artifact location. Keep previous records dated. When an upstream replacement retires a local patch, include the regression evidence that justified replacement and update CHANGES.md in the same change.
+
+## Compact CUDA MoE work lists, 2026-10-06 (F18)
+
+Baseline: fork `d43f0dfcd517b92ac7bb115c7936bdeff115aa83`, upstream `f0c41e0168dfd4b5ef72b21d1a311b24cc7a894a`. Candidate: the F18 changes following that fork revision. CUDA 12.9.86, Release, sm_86, CPU/CUDA/RPC with static backend registration, CUDA Graph support and all Flash Attention KV types compiled. Runs used four RTX 3090 GPUs on `user@192.168.50.53`; P40 and gfx906 were excluded. No unified memory, MTP or vision tower. The earlier fork changes, including native QSA and pipeline workers, are present in both sides. This comparison isolates F18 and is not a comparison of the whole fork with stock upstream.
+
+Correctness checks on the candidate:
+
+- Existing `test-backend-ops` infrastructure: 98/98 Q4_K/Q5_1/Q8_0 `MUL_MAT_ID` cases passed against CPU. This includes 30 explicit routing cases with sparse, concentrated, skewed and boundary-length expert groups, broadcast and per-expert inputs, 384 output rows and strided expert weights.
+- Compute Sanitizer 2025.2.1: memcheck passed all 30 routing cases with zero errors; racecheck passed 18 skewed/boundary cases with zero errors or warnings.
+- A saved standalone harness reused the same graph while alternating all-small, all-large and mixed expert distributions for each supported weight type. All 54 comparisons passed against CPU, maximum NMSE `7.17673833e-5` (threshold `5e-4`). Nsight Systems recorded 51 `cudaGraphLaunch` calls, confirming actual captured replay rather than only uncaptured submission.
+- CUDA source and the three changed type instantiations compiled for both sm_61 and sm_70. This is compile coverage, not execution coverage; F18 dispatch is disabled on those devices. HIP/MUSA/Vulkan were not rebuilt for F18.
+- Independent source review covered list capacities, padding, strides, shared-memory barriers and stream-local pool lifetime. No new public API or test executable was added to the repository.
+
+Model: `unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL`, HF snapshot `38bb39ee97821de2c9009abb7e93950eec396e66`. All expert weights fit on the four GPUs; the model's PLE data remained CPU-mapped. Native QSA was enabled, main KV Q8_0, tensor split `23,24,23,26`, eight CPU threads and no fit adjustment. Holmes corpus raw SHA-256: `585fca71a3c254647c2ad7b1ef6d6f2b1d563bf917ff77be85e79fdb471089dc`.
+
+Fresh-prompt throughput, three repeats after a 1024-token warmup. Both sides used the same final binary with `GGML_CUDA_MMQ_MOE_COMPACT=0/1`; the timed requests had no profiler collection. Prompt caching was disabled, one request at a time, four server slots. Context size was 16384 for the 8192-token prompt and 33280 for the 32768-token prompt. CPU workers and worker microbatch size were explicitly selected through `LLAMA_PIPELINE_WORKERS` and `LLAMA_PIPELINE_UBATCH`.
+
+| Workers | Prompt | Batch / microbatch | Original MMQ tok/s | Compact MMQ tok/s | Change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 8192 | 2048 / 512 | 1178.20 | 1539.30 | +30.65% |
+| 4 | 32768 | 8192 / 512 | 3016.17 | 3872.87 | +28.40% |
+| 4 | 32768 | 8192 / 2048 | 2715.44 | 3120.19 | +14.91% |
+
+With no workers, 128-token greedy decode after the 8192-token prompt measured 63.05 versus 63.87 tok/s. No decode speedup is attributed to F18; single-token execution uses the original path. All 128 generated token IDs matched across both modes and all repeats. A larger microbatch was slower for both paths in this setup; F18 does not remove pipeline balance and attention costs.
+
+Separate Nsight Systems captures of the 32768-token, four-worker, 512-token case measured 15.145 versus 7.457 cumulative GPU seconds in Q4_K/Q5_1 expert matmul kernels. Building compact work lists cost 0.034 GPU seconds. These are summed kernel durations across GPUs, not elapsed request times. The original profile used the final binary; the compact profile preceded removal of unused J=32/64 instantiations and used the same J=16/128 executed kernels. Final throughput and correctness checks used the reduced set of instantiations. Build logs and final source and binary manifests accompany the captures.
+
+Holmes PPL used eight 8192-token chunks with `-b 2048 -ub 512`, no workers, and `GGML_CUDA_MMQ_MOE_COMPACT=0/1`. Both baseline and candidate reported `1.0618 +/- 0.00294`. Values match at the executable's printed precision; this is not a claim of bitwise logits or universal quality equivalence.
+
+Raw logs, exact commands, profiler exports, comparison scripts and source/binary manifests are archived under `investigations/moe-compact-2026-10-06` in the local project and `/home/user/moe-compact-20261006` on the test host. These are evidence locations, not build dependencies. The host launcher in that directory sets library search paths and selects the four 3090 GPUs by UUID unless `CUDA_VISIBLE_DEVICES` is already set. Its sm_86 build is not an all-backend replacement for an existing deployment.

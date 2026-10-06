@@ -27,6 +27,7 @@ F08 and F14 have partial upstream coverage; their remaining differences are desc
 | F15 | Separate CUDA and HIP unified-memory switches | `d72bab2fc` | [ggml-cuda.cu](../../ggml/src/ggml-cuda/ggml-cuda.cu), [build.md](../build.md) |
 | F16 | RPC operation count/protocol patch update for QSA | `c94c992b9` | [ggml-rpc.h](../../ggml/include/ggml-rpc.h) |
 | F17 | Fork inventory, maintenance policy and validation record | documentation following `c94c992b9` | [FORK-MAINTENANCE.md](../../FORK-MAINTENANCE.md), [AGENTS.md](../../AGENTS.md), this directory |
+| F18 | Compact CUDA MoE work lists with per-expert tile widths | implementation following `d43f0dfcd` | [mmq.cu](../../ggml/src/ggml-cuda/mmq.cu), [mmq.cuh](../../ggml/src/ggml-cuda/mmq.cuh) |
 
 ## Adaptation to upstream f0c41e016 (2026-10-06)
 
@@ -117,3 +118,15 @@ On rebase, reconcile newly added upstream operations and protocol changes delibe
 This inventory, the root maintenance guide, validation record, README entry point and AGENTS.md policy are fork-specific documentation. Update them together when behavior or upstream coverage changes. Historical validation is dated evidence and must not be rewritten as a new test run.
 
 Explicit NEON candidate initialization is retired within F04. Experimental single-scheduler async execution and gfx906 MMQ tuning were not ported. Optional draft batching/concurrent execution remains outside the baseline. Keep these distinctions when reading old patches, branch names or performance tables. A feature branch is not evidence that its code is in master.
+
+## CUDA MoE prefill: F18
+
+`GGML_CUDA_MMQ_MOE_COMPACT=1` enables an experimental CUDA MMQ path. Unset or zero retains the original dispatch. Ordinary MMQ reserves a rectangular launch grid using the whole microbatch for every expert; sparse routing leaves many blocks empty and many nonempty tiles underfilled. F18 builds two GPU work lists from the existing expert boundaries. Experts with 1-16 routed rows use 16-column tiles; experts with more rows use 128-column tiles. Persistent blocks iterate only the listed work, with a grid capped at twice the device SM count. Empty experts contribute no tiles. The lists and their live counts are rebuilt on the GPU for every operation, including CUDA Graph replay, without a host readback.
+
+The implementation reuses existing activation quantization, routed input ordering, MMQ tile arithmetic and output scatter. It does not change routing, expert weights, QSA, public ggml APIs or the selected expert count. Different tile/reduction choices can still change floating-point results; operator and model validation are required. Temporary list storage comes from the existing stream-local CUDA pool. Shared execution depends on its existing stream ownership and completion guarantees, not a new global pool.
+
+Eligibility requires NVIDIA Ampere or newer with compiled MMA support, Q4_K/Q5_1/Q8_0 weights, 64-1024 experts, 128-16384 input tokens, one expert-weight sample, an output row count divisible by 128, and sufficient per-block shared memory for both tile sizes. Other quantizations, shapes and devices retain the existing path. Single-token decode is unchanged. The switch does not force MMQ when normal dispatch chooses another operation. CUDA sm_86 is the measured target; HIP, Vulkan, pre-Ampere NVIDIA and other model/quantization combinations have no performance claim.
+
+F12 padding remains required: tile loads may read past an expert's live rows within the padded temporary allocation. The small-list capacity assumes at most one tile per small expert. Changing tile widths or the threshold requires updating these bounds and rerunning memory/race checks. Preserve strided expert weights, non-power-of-two row-tile counts and dynamic routing when replacing this path.
+
+Compared upstream `f0c41e016` has no equivalent compact NVIDIA work list. Related AMD downstream work is discussed in [upstream discussion 26349](https://github.com/ggml-org/llama.cpp/discussions/26349); that is not evidence of coverage in the pinned upstream base. On rebase, replace F18 only after matched correctness, CUDA Graph/pool-lifetime and sparse/dense-routing throughput checks. See [VALIDATION.md](VALIDATION.md) for the exact measured configuration and limitations.

@@ -1383,6 +1383,42 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <ggml_type type, int J>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false), ggml_cuda_mmq_get_occupancy(type, J, false))
+static __global__ void mul_mat_q_moe(
+        const char * x, const int * y, const int32_t * ids_dst, const int32_t * expert_bounds,
+        const int2 * expert_tiles, const int32_t * expert_tile_count, float * dst,
+        const int nrows_x, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int stride_channel_x, const uint3 blocks_per_ne00, const uint3 nty) {
+    if (ggml_cuda_mmq_get_config(type, J, false).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
+    constexpr int I = ggml_cuda_mmq_get_I(type, J, false);
+    extern __shared__ int ids_dst_shared[];
+    const int nwork = *expert_tile_count * nty.z;
+
+    for (int work = blockIdx.x; work < nwork; work += gridDim.x) {
+        const uint2 index = fast_div_modulo(work, nty);
+        const int2 tile = expert_tiles[index.x];
+        const int row = index.y*I;
+        __syncthreads();
+        for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
+            ids_dst_shared[j] = ids_dst[tile.y + j];
+        }
+        __syncthreads();
+
+        mul_mat_q_process_tile<type, J, false, false>(x, tile.x*stride_channel_x + row*stride_row_x,
+                y + tile.y*(sizeof(block_q8_1_mmq)/sizeof(int)), ids_dst_shared, dst + row, nullptr, nullptr,
+                stride_row_x, ncols_y, stride_col_dst, nrows_x - row - 1,
+                expert_bounds[tile.x + 1] - tile.y - 1, 0, blocks_per_ne00.z);
+    }
+}
+#endif
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * y_scale;
@@ -1391,6 +1427,9 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    const int2 * expert_tiles = nullptr;
+    const int32_t * expert_tile_count = nullptr;
+    int64_t expert_tiles_max = 0;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1413,6 +1452,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) &&
+            !fallback && prec_src1 == GGML_PREC_Q8 && (J == 16 || J == 128)) {
+        if (args.expert_tiles) {
+            GGML_ASSERT(args.ncols_opt == J);
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe<type, J>), nbytes_shared);
+            const int nty = (args.nrows_x + config.I - 1) / config.I;
+            const int nblocks = std::min<int64_t>(args.expert_tiles_max*nty, 2*nsm);
+            mul_mat_q_moe<type, J><<<nblocks, block_dims, nbytes_shared, stream>>>(args.x, args.y, args.ids_dst,
+                    args.expert_bounds, args.expert_tiles, args.expert_tile_count, args.dst,
+                    args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst, args.stride_channel_x,
+                    init_fastdiv_values(args.ncols_x / ggml_cuda_type_traits<type>::qk), init_fastdiv_values(nty));
+            return;
+        }
+    }
+#endif
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);

@@ -5321,6 +5321,56 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_routing : public test_mul_mat_id {
+    const int routing;
+
+    test_mul_mat_id_routing(ggml_type type, bool broadcast, int routing, int64_t n, int64_t m = 128, int64_t m_v = 0)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 512, routing == 3 ? 1 : 10, broadcast, m, n, 512, 1.0f, m_v), routing(routing) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VAR_TO_STR(routing);
+    }
+
+    void set_ids(ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            std::vector<int32_t> data(t->ne[0]);
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                for (int i = 0; i < t->ne[0]; ++i) {
+                    data[i] = routing == 2 ? i : (r*n_used + i) % n_mats;
+                    if (routing == 1) {
+                        data[i] = i == 0 ? 0 : 1 + (r*(n_used - 1) + i - 1) % (n_mats - 1);
+                    }
+                }
+                if (routing == 3) {
+                    const int counts[] = { 1, 7, 8, 9, 15, 16, 17, 31, 32, 33 };
+                    int64_t end = 0;
+                    data[0] = n_mats - 1;
+                    for (int i = 0; i < int(sizeof(counts)/sizeof(counts[0])); ++i) {
+                        end += counts[i];
+                        if (r < end) {
+                            data[0] = i;
+                            break;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r*t->nb[1], data.size()*sizeof(int32_t));
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        set_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        set_ids(ctx);
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -10740,6 +10790,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+        for (bool broadcast : { false, true }) {
+            for (int routing : { 0, 1, 2, 3 }) {
+                test_cases.emplace_back(new test_mul_mat_id_routing(type, broadcast, routing, 256));
+            }
+            test_cases.emplace_back(new test_mul_mat_id_routing(type, broadcast, 1, 256, 384, 512));
         }
     }
 
