@@ -877,13 +877,15 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1 = GGML_PREC_Q8>
+template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1 = GGML_PREC_Q8, bool swiglu = false, bool q8_out = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const char * __restrict__ gate = nullptr, block_q8_1_mmq * __restrict__ dst_q8 = nullptr,
+        const mmq_q8_1_ds_layout ds_layout = MMQ_Q8_1_DS_LAYOUT_DS4) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -896,6 +898,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    constexpr auto config = ggml_cuda_mmq_get_config(type, J, fallback, prec_src1);
+    int * tile_gate = tile_x + I * ggml_cuda_mmq_get_sram_stride(config.sram_layout);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks. src1 above Q4 uses the generic
@@ -910,11 +914,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int blocks_per_iter = ITER_K / qk;
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
+    float sum_gate[swiglu ? J*I / (nwarps*warp_size) : 1] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        if constexpr (swiglu) {
+            load_tiles(gate, tile_gate, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -928,6 +936,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
 
         vec_dot(tile_x, tile_y, sum, 0);
+        if constexpr (swiglu) {
+            vec_dot(tile_gate, tile_y, sum_gate, 0);
+        }
 
         __syncthreads();
 
@@ -944,11 +955,53 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
 
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        if constexpr (swiglu) {
+            vec_dot(tile_gate, tile_y, sum_gate, MMQ_TILE_NE_K);
+        }
 
         __syncthreads();
     }
 
-    if (fixup) {
+    if constexpr (swiglu) {
+#pragma unroll
+        for (int i = 0; i < J*I / (nwarps*warp_size); ++i) {
+            sum[i] = (sum_gate[i] / (1.0f + expf(-sum_gate[i]))) * sum[i];
+        }
+    }
+
+    if constexpr (q8_out) {
+        // The weight and activation tiles are dead. Reuse their shared memory for quantization.
+        float * values = (float *) tile_y;
+        write_back(sum, ids_dst, values, nullptr, I, I - 1, tile_y_max_j);
+        __syncthreads();
+        for (int l = threadIdx.y*warp_size + threadIdx.x; l < J*I/4; l += nwarps*warp_size) {
+            const int j = l / (I/4);
+            const int i = l % (I/4) * 4;
+            if (j > tile_y_max_j) {
+                continue;
+            }
+            const float4 v = ((const float4 *) values)[l];
+            float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+            float sum_v = v.x + v.y + v.z + v.w;
+#pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, warp_size));
+                sum_v += __shfl_xor_sync(0xFFFFFFFF, sum_v, offset, warp_size);
+            }
+            const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+            const float d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
+            const char4 q = make_char4(roundf(v.x*d_inv), roundf(v.y*d_inv), roundf(v.z*d_inv), roundf(v.w*d_inv));
+            block_q8_1_mmq & block = dst_q8[(i / QK8_1_MMQ)*ncols_y + j];
+            ((char4 *) block.qs)[(i % QK8_1_MMQ)/4] = q;
+            if (i % 32 == 0) {
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+                    block.ds4[(i % QK8_1_MMQ)/32] = make_half2(d, sum_v);
+                } else {
+                    block.d4[(i % QK8_1_MMQ)/32] = d;
+                }
+            }
+        }
+    } else if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
     } else {
         write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
@@ -1439,6 +1492,56 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <int J, bool q8_out = false>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q4_K, J, false), 1)
+static __global__ void mul_mat_q_moe_swiglu(const mmq_args args, const char * gate, const uint3 nty,
+        block_q8_1_mmq * dst_q8, const mmq_q8_1_ds_layout ds_layout) {
+    constexpr ggml_type type = GGML_TYPE_Q4_K;
+    if (ggml_cuda_mmq_get_config(type, J, false).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
+    constexpr int I = ggml_cuda_mmq_get_I(type, J, false);
+    extern __shared__ int ids_dst_shared[];
+    const int nwork = *args.expert_tile_count * nty.z;
+
+    for (int work = blockIdx.x; work < nwork; work += gridDim.x) {
+        const uint2 index = fast_div_modulo(work, nty);
+        const int2 tile = args.expert_tiles[index.x];
+        const int row = index.y*I;
+        __syncthreads();
+        for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
+            ids_dst_shared[j] = q8_out ? j : args.ids_dst[tile.y + j];
+        }
+        __syncthreads();
+
+        mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8, true, q8_out>(args.x,
+                tile.x*args.stride_channel_x + row*args.stride_row_x,
+                args.y + tile.y*(sizeof(block_q8_1_mmq)/sizeof(int)), ids_dst_shared, args.dst + row, nullptr, nullptr,
+                args.stride_row_x, args.ncols_y, args.nrows_dst, args.nrows_x - row - 1,
+                args.expert_bounds[tile.x + 1] - tile.y - 1, 0, args.ncols_x / QK_K, gate,
+                q8_out ? dst_q8 + (row / QK8_1_MMQ)*args.ncols_y + tile.y : nullptr, ds_layout);
+    }
+}
+
+template <int J, bool q8_out = false>
+static void launch_mul_mat_q_moe_swiglu(ggml_backend_cuda_context & ctx, const mmq_args & args, const char * gate, cudaStream_t stream,
+        block_q8_1_mmq * dst_q8 = nullptr, mmq_q8_1_ds_layout ds_layout = MMQ_Q8_1_DS_LAYOUT_DS4) {
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const auto config = ggml_cuda_mmq_get_config(GGML_TYPE_Q4_K, J, false, device.cc);
+    const size_t nbytes_shared = std::max(mmq_get_nbytes_shared(config, device.cc) + ggml_cuda_mmq_get_nbytes_shared_x(config, device.cc),
+            q8_out ? J*sizeof(int) + J*config.I*sizeof(float) : size_t(0));
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe_swiglu<J, q8_out>), nbytes_shared);
+    const int nty = args.nrows_x / config.I;
+    const int nblocks = std::min<int64_t>(args.expert_tiles_max*nty, 2*device.nsm);
+    const dim3 threads(device.warp_size, config.nthreads / device.warp_size, 1);
+    mul_mat_q_moe_swiglu<J, q8_out><<<nblocks, threads, nbytes_shared, stream>>>(args, gate, init_fastdiv_values(nty), dst_q8, ds_layout);
+}
+#endif
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1670,6 +1773,11 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * gate = nullptr, ggml_tensor * down = nullptr);
+
+bool ggml_cuda_should_fuse_mmq_moe_down(const ggml_tensor * up, const ggml_tensor * glu, const ggml_tensor * down, bool check_batch = true);
+
+bool ggml_cuda_should_fuse_mmq_moe(const ggml_tensor * up, const ggml_tensor * glu, bool check_batch = true);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

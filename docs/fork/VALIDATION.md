@@ -205,3 +205,56 @@ Separate Nsight Systems captures of the 32768-token, four-worker, 512-token case
 Holmes PPL used eight 8192-token chunks with `-b 2048 -ub 512`, no workers, and `GGML_CUDA_MMQ_MOE_COMPACT=0/1`. Both baseline and candidate reported `1.0618 +/- 0.00294`. Values match at the executable's printed precision; this is not a claim of bitwise logits or universal quality equivalence.
 
 Raw logs, exact commands, profiler exports, comparison scripts and source/binary manifests are archived under `investigations/moe-compact-2026-10-06` in the local project and `/home/user/moe-compact-20261006` on the test host. These are evidence locations, not build dependencies. The host launcher in that directory sets library search paths and selects the four 3090 GPUs by UUID unless `CUDA_VISIBLE_DEVICES` is already set. Its sm_86 build is not an all-backend replacement for an existing deployment.
+
+## CUDA MoE MMQ SwiGLU fusion, 2026-10-06 (F19)
+
+Baseline: `9da5fa77d2699008fc0fdeb9dfd10d3ea500995c` (F18). Candidate: F19 changes following that commit, with exact source hashes in `tested-source.json` and source/binary hashes in `verification.json`. The model, corpus, four RTX 3090 GPUs, CUDA 12.9 sm_86 toolchain, Q8_0 KV, native QSA, thread counts and tensor split match F18 above. No UM, MTP or vision tower. This isolates fusion relative to compact MMQ, not the whole fork relative to upstream.
+
+Both sides use the same candidate binary with `GGML_CUDA_MMQ_MOE_COMPACT=1`; only `GGML_CUDA_MMQ_MOE_SWIGLU=0/1` changes. The following are means of three fresh-prompt requests after a 1024-token warmup, without profiler collection during the timed requests. The zero-worker pair was repeated after test compilation finished to avoid CPU interference. Published numbers use that final pair.
+
+| Workers | Prompt | Batch / microbatch | Compact MMQ tok/s | Compact MMQ + fusion tok/s | Change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 8192 | 2048 / 512 | 1533.56 | 1612.92 | +5.18% |
+| 4 | 32768 | 8192 / 512 | 3892.16 | 4040.75 | +3.82% |
+
+The zero-worker 128-token decode measured 62.97 versus 62.57 tok/s; this path is unchanged and no decode gain is claimed. All 128 output token IDs matched across modes and repeats. The single output token in each four-worker run also matched. Holmes PPL over eight 8192-token chunks was `1.0618 +/- 0.00294` in both modes, at the executable's printed precision. This sampled agreement does not establish universal bitwise equivalence.
+
+Validation:
+
+- `test-backend-ops`: 14/14 routed gate/up/GLU cases passed against CPU, covering broadcast and per-expert inputs, sparse/hot/concentrated/boundary routing, unsupported row and batch sizes, strided views, extra gate consumers, GEGLU and clamped SwiGLU fallback. Plain fused SwiGLU retains the `5e-4` NMSE threshold. The unsupported clamped case uses the existing quantized-GLU suite's `5e-3` threshold: the tighter plain-matmul threshold failed even with fusion disabled (`0.000650604` NMSE).
+- Existing Q4_K/Q5_1/Q8_0 `MUL_MAT_ID` cases: 98/98 passed. Memcheck passed the 12 routing/shape/consumer cases with zero errors; racecheck passed eight skewed/boundary/fallback cases with zero hazards. These sanitizer runs preceded the two additional unsupported-GLU cases.
+- Changing-routing graph replay passed 18 Q4_K comparisons through fusion and 36 Q5_1/Q8_0 fallback comparisons against CPU.
+- Scheduler-allocated graphs with a computed activation, reused graph storage and batch sizes 256, 129, 512 and 64 passed 72 comparisons. A second fixture with separately allocated weight buffers and strided 384-row views of 512-row expert matrices passed another 72. Each Nsight capture recorded 108 fused kernel executions; the 64-token shape retained the fallback. These fixtures refill scheduler-owned inputs before each invocation, as their storage can be reused after the graph consumes them.
+- A real four-worker, 32768-token profile recorded 5888 fused kernel launches. Their cumulative GPU duration was 3.869 seconds; this is a sum across GPUs, not request latency. The reported private/shared compute reservations were identical with fusion off/on (CUDA0: 40.00/192.04 MiB; CUDA1-2: 40.00/192.12 MiB; CUDA3: 3.98/192.12 MiB).
+- The fused J=16 and J=64 kernels used 191 and 255 registers per thread with zero stack bytes in the sm_86 object. The selected width avoids spilling; high register use remains a throughput constraint.
+- CUDA source and Q4_K/Q5_1/Q8_0 MMQ instantiations compiled for sm_61 and sm_70. F19 dispatch stays disabled there. HIP/MUSA/Vulkan and other NVIDIA architectures were not executed for F19.
+- Independent source review found no blocking correctness issue. Its scheduler-lifetime and unsupported-GLU coverage requests were addressed by the tests above. `git diff --check` and ASCII checks of added C++/CUDA lines passed.
+
+Evidence is in local `investigations/moe-fusion-2026-10-06` and remote `/home/user/moe-fusion-20261006`: operator/sanitizer logs, scheduler fixtures, profiles, matched performance and PPL JSON, patch and manifests. The remote `bin/` package was verified byte-identical to all 14 measured build binaries. `/home/user/moe-fusion-20261006/llama-server` sets its library search path and defaults to the four 3090 UUIDs; the two optimization switches must still be set explicitly. This is a CPU/CUDA/RPC sm_86 validation build, not an all-backend deployment build. The server was left stopped.
+
+## Direct Q8 output for MoE SwiGLU, 2026-10-07 (F19 refinement)
+
+Baseline: F19 with its FP32 SwiGLU output. Candidate: the direct-Q8 extension following `9da5fa77d`, with the unchanged F18 and F19 switches enabled. `GGML_CUDA_MMQ_MOE_Q8=0/1` selects the comparison in the same binary. The frozen earlier F19 build is `/home/user/moe-fusion-20261006/bin`; exact candidate source and binary hashes accompany the evidence below. Hardware, model snapshot, Holmes corpus, native QSA, Q8_0 KV, tensor split and CPU settings match the preceding F19 record. This measures the additional output-quantization fusion, not stock upstream versus the complete fork.
+
+The final direct-Q8 path uses J=16/32 for gate/up, while FP32-output F19 stays at J=16/64 and down stays at J=16/128. The direct kernels use 177/249 registers per thread and zero stack bytes on sm_86. A J=64 direct-output trial used 56 stack bytes per thread; it is not the selected path.
+
+Correctness and dispatch:
+
+- `test-backend-ops`: 15/15 full gate/up/SwiGLU/down graphs passed against CPU at the unchanged `5e-4` NMSE limit. Cases include Q5_1 and Q8_0 down, broadcast and per-slot input, sparse/hot/concentrated/boundary routing, hidden widths 128/384/640, an extra SwiGLU consumer, small-batch fallback, zero input and unsupported Q4_0 down fallback. The 128-row cases exercise fallback; direct packing is exercised at 384/640 rows. Existing F19 tests passed 14/14 and existing Q4_K/Q5_1/Q8_0 MMID tests passed 98/98.
+- Memcheck passed 15/15 cases with zero errors, including a repeat on the final packaged binary after the NaN guard correction below. Racecheck passed 11/11 skewed/boundary/fallback cases with zero hazards before that two-expression correction; allocation, indexing and synchronization did not change afterward.
+- A changing-routing scheduler fixture passed 72 CPU comparisons at batches 256, 129, 512 and 64. Nsight recorded 68 CUDA Graph launches and 108 direct-Q8 kernel executions. Separate DS4/D4 fixtures included zero-input replay and compared all 4,428,288 output floats per layout with the FP32-output path: both were byte-identical. Both layout comparisons and all 15 operator cases were repeated after the final numerical correction.
+- An all-NaN fixture exposed a D4 discrepancy: the initial zero guard selected a zero scale for NaN. The final guard handles only `amax == 0`; all other values follow the original quantizer's division. The original and corrected paths each preserve 33024/33024 NaN outputs. The failing and passing tests are archived as `nan-red-*` and `nan-green-*`.
+- Holmes PPL over eight 8192-token chunks is `1.0618 +/- 0.00294` with direct Q8 disabled and enabled, including a repeated enabled run after the final correction. The initial 8192-token performance runs produced identical 128-token greedy outputs across both modes and all repeats. These are sampled comparisons, not a universal quality guarantee.
+- CUDA sm_61/sm_70 compilation passed for the direct-output code, with runtime dispatch disabled there. That compilation preceded only the zero-guard expression change. HIP/MUSA/Vulkan and other NVIDIA devices were not executed for this refinement. Fresh source review covered layout, padding, consumers, allocation, replay and the final tile-width adjustment; the NaN correction was also independently reviewed.
+
+A 32768-token, four-worker Nsight capture removed 2944 routing-helper launches and 2944 separate activation-quantization launches. Relative to FP32-output fusion, cumulative routing-helper duration fell from 0.213 to 0.109 GPU seconds, and activation quantization from 0.568 to 0.499 GPU seconds. Gate/up/SwiGLU cumulative duration was 3.866 seconds for FP32 output and 3.796 seconds for direct Q8 with J=32. These are summed durations across four GPUs, not elapsed request time. The eliminated helper work accounts for less than 1% of total cumulative kernel time in this workload. Compute reservations in the measured four-worker runs remained unchanged: CUDA0 private/shared 40.00/192.04 MiB, CUDA1-2 40.00/192.12 MiB, CUDA3 3.98/192.12 MiB. This traffic optimization does not remove the intermediate tensors from the graph allocator, and no total VRAM reduction is claimed.
+
+Final throughput used the corrected binary, a full 32768-token warmup and five fresh-prompt requests per mode, without profiler collection. Direct Q8 ran first, then FP32 output. Both used four workers, four server slots, one request at a time, no prompt caching, context 33280 and batch/microbatch 8192/512. The table reports arithmetic means; the raw records are `verified-q0-w4.json` and `verified-q1-w4.json`.
+
+| Workers | Prompt | FP32-output fusion tok/s | Direct-Q8 fusion tok/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 32768 | 4056.87 | 4102.34 | +1.12% |
+
+The baseline range was 4044.63-4067.22 tok/s; direct Q8 ranged from 4094.17 to 4107.69 tok/s. Earlier three-repeat, 8192-token runs with a shorter warmup measured 1605.79 versus 1622.03 tok/s (+1.01%) without workers. Those runs preceded the NaN correction and are supplemental evidence. Single-token decode retains the existing path; no decode acceleration is claimed. The measured prefill improvement is small and specific to this workload, so the new switch remains off by default.
+
+Evidence is archived in local `investigations/moe-direct-q8-2026-10-06` and remote `/home/user/moe-direct-q8-20261006`, including commands, profiles, full test logs, source patch and source/binary manifests. The remote launcher `/home/user/moe-direct-q8-20261006/llama-server` sets its own library search path and defaults to the four 3090 UUIDs. Enable the path with `GGML_CUDA_MMQ_MOE_COMPACT=1 GGML_CUDA_MMQ_MOE_SWIGLU=1 GGML_CUDA_MMQ_MOE_Q8=1`. This is a CPU/CUDA/RPC sm_86 validation build, not an all-backend deployment. The server was left stopped.

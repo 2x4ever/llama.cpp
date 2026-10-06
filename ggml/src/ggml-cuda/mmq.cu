@@ -169,7 +169,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * gate, ggml_tensor * down) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -214,7 +215,7 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+    const ggml_prec prec_src1 = gate ? GGML_PREC_Q8 : ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
@@ -358,7 +359,7 @@ void ggml_cuda_mul_mat_q(
             ne02 >= 64 && ne02 <= 1024 && ne12 >= 128 && ne12 <= 16384 && ne03 == 1 &&
             (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0)) {
         constexpr int tile_small = 16;
-        constexpr int tile_large = 128;
+        const int tile_large = down ? 32 : gate ? 64 : 128;
         constexpr int limit_small = 16;
         const auto config_small = ggml_cuda_mmq_get_config(src0->type, tile_small, false, cc);
         const auto config_large = ggml_cuda_mmq_get_config(src0->type, tile_large, false, cc);
@@ -385,6 +386,62 @@ void ggml_cuda_mul_mat_q(
         args.expert_tile_count = counts.get();
         args.expert_tiles_max = max_small;
         args.ncols_opt = tile_small;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (gate && down) {
+            const ggml_tensor * weights = down->src[0];
+            const int64_t hidden_padded = GGML_PAD(ne01, MATRIX_ROW_PADDING);
+            const int padding_down = ggml_cuda_mmq_get_J_max(weights->type, false, cc, 128);
+            const size_t blocks_hidden = ne_get_rows*ne01 / QK8_1_MMQ;
+            const size_t blocks_padded = ne_get_rows*hidden_padded / QK8_1_MMQ + padding_down;
+            ggml_cuda_pool_alloc<block_q8_1_mmq> hidden(ctx.pool(), blocks_padded);
+            CUDA_CHECK(cudaMemsetAsync(hidden.get() + blocks_hidden, 0, (blocks_padded - blocks_hidden)*sizeof(block_q8_1_mmq), stream));
+            const auto ds_layout = mmq_get_q8_1_ds_layout(weights->type);
+            launch_mul_mat_q_moe_swiglu<tile_small, true>(ctx, args, (const char *) gate->data, stream, hidden.get(), ds_layout);
+            args.expert_tiles = tiles.get() + max_small;
+            args.expert_tile_count = counts.get() + 1;
+            args.expert_tiles_max = max_large;
+            args.ncols_opt = tile_large;
+            launch_mul_mat_q_moe_swiglu<32, true>(ctx, args, (const char *) gate->data, stream, hidden.get(), ds_layout);
+
+            if (ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                const size_t size_data = ggml_nbytes(weights);
+                const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weights->buffer, weights);
+                if (size_alloc > size_data) {
+                    GGML_ASSERT(ggml_is_contiguously_allocated(weights) && !weights->view_src);
+                    CUDA_CHECK(cudaMemsetAsync((char *) weights->data + size_data, 0, size_alloc - size_data, stream));
+                }
+            }
+            const size_t ts = ggml_type_size(weights->type);
+            mmq_args down_args = {
+                (const char *) weights->data, weights->type, (const int *) hidden.get(), ids_dst.get(), expert_bounds.get(), (float *) down->data,
+                nullptr,
+                weights->ne[0], weights->ne[1], ne_get_rows, int64_t(weights->nb[1]/ts), ne_get_rows, int64_t(down->nb[1]/sizeof(float)),
+                ne02, ne02, int64_t(weights->nb[2]/ts), 0, int64_t(down->nb[2]/sizeof(float)),
+                1, 1, int64_t(weights->nb[3]/ts), 0, int64_t(down->nb[3]/sizeof(float)),
+                ne12, tile_small};
+            mmq_moe_tiles<<<1, nthreads, 2*nthreads*sizeof(int), stream>>>(expert_bounds.get(), tiles.get(),
+                    tiles.get() + max_small, counts.get(), ne02, tile_small, 128, limit_small);
+            down_args.expert_tiles = tiles.get();
+            down_args.expert_tile_count = counts.get();
+            down_args.expert_tiles_max = max_small;
+            ggml_cuda_mul_mat_q_switch_type(ctx, down_args, stream, GGML_PREC_Q8);
+            down_args.expert_tiles = tiles.get() + max_small;
+            down_args.expert_tile_count = counts.get() + 1;
+            down_args.expert_tiles_max = ne02 + ne_get_rows/128;
+            down_args.ncols_opt = 128;
+            ggml_cuda_mul_mat_q_switch_type(ctx, down_args, stream, GGML_PREC_Q8);
+            return;
+        }
+        if (gate) {
+            launch_mul_mat_q_moe_swiglu<tile_small>(ctx, args, (const char *) gate->data, stream);
+            args.expert_tiles = tiles.get() + max_small;
+            args.expert_tile_count = counts.get() + 1;
+            args.expert_tiles_max = max_large;
+            args.ncols_opt = tile_large;
+            launch_mul_mat_q_moe_swiglu<64>(ctx, args, (const char *) gate->data, stream);
+            return;
+        }
+#endif
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         args.expert_tiles = tiles.get() + max_small;
         args.expert_tile_count = counts.get() + 1;
@@ -395,6 +452,75 @@ void ggml_cuda_mul_mat_q(
     }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+bool ggml_cuda_should_fuse_mmq_moe(const ggml_tensor * up, const ggml_tensor * glu, bool check_batch) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool enabled = [] {
+        const char * compact = getenv("GGML_CUDA_MMQ_MOE_COMPACT");
+        const char * swiglu = getenv("GGML_CUDA_MMQ_MOE_SWIGLU");
+        return compact && atoi(compact) != 0 && swiglu && atoi(swiglu) != 0;
+    }();
+    if (!enabled || up->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    const auto * weights = up->src[0];
+    const auto * input = up->src[1];
+    const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    if (!ampere_mma_available(device.cc) || weights->type != GGML_TYPE_Q4_K ||
+            input->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            weights->ne[1] % 128 != 0 || weights->ne[2] < 64 || weights->ne[2] > 1024 ||
+            weights->ne[3] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(glu) ||
+            input->nb[0] != sizeof(float) || input->nb[2] % input->nb[1] != 0 ||
+            (check_batch && (input->ne[2] < 128 || input->ne[2] > 16384 ||
+                !ggml_cuda_should_use_mmq(weights->type, device.cc, input->ne[2], weights->ne[2])))) {
+        return false;
+    }
+    for (int J : {16, 64}) {
+        const auto config = ggml_cuda_mmq_get_config(weights->type, J, false, device.cc);
+        if (config.type == GGML_TYPE_COUNT || !config.use_mma_data_layout(device.cc) ||
+                mmq_get_nbytes_shared(config, device.cc) + ggml_cuda_mmq_get_nbytes_shared_x(config, device.cc) > device.smpbo) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(up, glu, check_batch);
+    return false;
+#endif
+}
+
+bool ggml_cuda_should_fuse_mmq_moe_down(const ggml_tensor * up, const ggml_tensor * glu, const ggml_tensor * down, bool check_batch) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MMQ_MOE_Q8");
+        return value && atoi(value) != 0;
+    }();
+    if (!enabled || !ggml_cuda_should_fuse_mmq_moe(up, glu, check_batch) || down->op != GGML_OP_MUL_MAT_ID ||
+            down->src[1] != glu || down->src[2] != up->src[2] || !ggml_is_contiguous(down)) {
+        return false;
+    }
+    const auto * weights = down->src[0];
+    const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    if ((weights->type != GGML_TYPE_Q5_1 && weights->type != GGML_TYPE_Q8_0) ||
+            weights->ne[0] != glu->ne[0] || weights->ne[1] % 128 != 0 || weights->ne[2] != up->src[0]->ne[2] ||
+            weights->ne[3] != 1 || weights->nb[0] != ggml_type_size(weights->type) || down->type != GGML_TYPE_F32 ||
+            (check_batch && !ggml_cuda_should_use_mmq(weights->type, device.cc, glu->ne[2], weights->ne[2]))) {
+        return false;
+    }
+    for (int J : {16, 32}) {
+        const auto config = ggml_cuda_mmq_get_config(GGML_TYPE_Q4_K, J, false, device.cc);
+        if (config.I % QK8_1_MMQ != 0 || J*sizeof(int) + J*config.I*sizeof(float) > device.smpbo) {
+            return false;
+        }
+    }
+    for (int J : {16, 128}) {
+        const auto config = ggml_cuda_mmq_get_config(weights->type, J, false, device.cc);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, device.cc) > device.smpbo) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
