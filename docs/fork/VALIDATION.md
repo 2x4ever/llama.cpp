@@ -258,3 +258,35 @@ Final throughput used the corrected binary, a full 32768-token warmup and five f
 The baseline range was 4044.63-4067.22 tok/s; direct Q8 ranged from 4094.17 to 4107.69 tok/s. Earlier three-repeat, 8192-token runs with a shorter warmup measured 1605.79 versus 1622.03 tok/s (+1.01%) without workers. Those runs preceded the NaN correction and are supplemental evidence. Single-token decode retains the existing path; no decode acceleration is claimed. The measured prefill improvement is small and specific to this workload, so the new switch remains off by default.
 
 Evidence is archived in local `investigations/moe-direct-q8-2026-10-06` and remote `/home/user/moe-direct-q8-20261006`, including commands, profiles, full test logs, source patch and source/binary manifests. The remote launcher `/home/user/moe-direct-q8-20261006/llama-server` sets its own library search path and defaults to the four 3090 UUIDs. Enable the path with `GGML_CUDA_MMQ_MOE_COMPACT=1 GGML_CUDA_MMQ_MOE_SWIGLU=1 GGML_CUDA_MMQ_MOE_Q8=1`. This is a CPU/CUDA/RPC sm_86 validation build, not an all-backend deployment. The server was left stopped.
+
+## 2026-10-12: Native QSA selector scratch lifetime
+
+Scope: F08 allocation lifetime only. The indexer product buffer is returned to the same-stream backend pool after enqueueing score reduction, before top-k allocates its scratch. The reduced scores and selected IDs remain live. Tile sizes, arithmetic, token selection and public APIs are unchanged. This does not change Native QSA selection semantics.
+
+The baseline is the user's published fork at `1e2ec648f5d7ccc73b2a0d96c1e2dfe5f0192914`, built in `/home/user/llama.cpp.my/build/bin`. The isolated candidate at `/home/user/qsa-scratch-20261012/bin` copies those binaries and replaces only `libggml-cuda.so`, linked from the original objects with the patched `qsa.cu` object. CUDA 12.9 compilation includes architectures 61 and 86; runtime checks below use RTX 3090. Other backend binaries are unchanged. This is a before/after comparison within the fork, not against upstream. The source-only patch and exact build commands are saved with the evidence.
+
+Candidate CUDA library SHA-256: `87d33e820c9d5a2816a2bb8574014118f39231fea3d3bfd5958c6521e6e43d09`. Baseline CUDA library SHA-256: `0b1b51f9cb06f5a8d607c5d976800572316a8dd85e74695bbbf2f667b6d0417e`.
+
+A deterministic nonzero indexer probe exercises 513 through 125056 blocks, one through 512 queries, four indexer heads, 128-dimensional keys and a 512-block budget. Ten shapes, including repetitions and transitions between small and large shapes, each run five times with changed queries. All 50 output index tensors match the baseline bitwise. The trace confirms CUDA Graph replay, reuse without further VMM growth at repeated shapes, and full unmapping at backend destruction. All eight existing CUDA `QSA_SELECT` cases pass against the CPU reference, including the precomputed-score path, masks, tails and multiple sequences. These are targeted operator checks; full-model PPL was not rerun for this lifetime-only change.
+
+The VMM allocation trace measures a peak of 168 MiB before and 108 MiB after, including at 125056 blocks, corresponding to a 500224-cell KV capacity with ratio four. A regression check requiring at most 112 MiB fails on the baseline and passes on the candidate. The 60 MiB saving is per backend scratch pool; five workers can save 300 MiB per GPU if this operator sets their peak. Scheduler compute reservations are separate. Other operators can set a higher pool peak, and this change does not trim already reserved memory back to the driver.
+
+Compute Sanitizer `memcheck` passes all eight existing `QSA_SELECT` cases on the candidate with `ERROR SUMMARY: 0 errors` and exit code zero. HIP, legacy CUDA pools and V100 were not tested. P40 loaded the unchanged vision tower in the server runs below, but image inference was not exercised.
+
+The mixed server check uses the user's launch configuration: Flash-Next UD-Q4_K_XL, four RTX 3090s, Native QSA, Q8_0 KV, no UM, context 500000, eight slots, five workers, microbatch 512, batch 4096, split `23,24,23,26`, compact masks and the three MoE kernel flags enabled. The vision tower remains on P40. Only binary/library location and the loopback test endpoint differ. Both loaded-library maps are saved. Two requests each prefill 80000 tokens and keep decoding while a third slot processes three successive uncached 100000-token prompts. Both decode requests advance in every cycle; each third request evaluates all 100000 input tokens and generates 32 tokens. Both builds complete all cycles, cancellation and slot draining, remain healthy and exit cleanly.
+
+Peak board usage from one-second `nvidia-smi` samples:
+
+| Device | Before, MiB | After, MiB | Reduction, MiB |
+| --- | ---: | ---: | ---: |
+| CUDA0, RTX 3090 | 23430 | 23270 | 160 |
+| CUDA1, RTX 3090 | 22688 | 22528 | 160 |
+| CUDA2, RTX 3090 | 22938 | 22778 | 160 |
+| CUDA3, RTX 3090 | 23646 | 23486 | 160 |
+| P40 vision tower | 1270 | 1270 | 0 |
+
+The measured saving is 640 MiB across the four target GPUs. This workload does not fill the whole KV capacity, so its saving differs from the maximum-span operator probe. On the most constrained card, minimum sampled free memory increases from 479 to 639 MiB. Sampling can miss brief peaks. The three concurrent prefill rates are 1564.06/1500.89/1490.29 tok/s before and 1562.43/1494.93/1491.67 tok/s after. Both decoders produce about 335 tokens per prefill cycle on each build. This single A/B pair shows no large throughput change; it is not a precision speed benchmark.
+
+The original OOM did not reproduce in either short server run. These results establish lower scratch peaks and successful mixed-context execution, not the absence of every leak or OOM during long service. Baseline per-card peak usage rises by roughly 78 MiB between the first and third cycles; the candidate has the same increase with a 160 MiB lower peak. Pool growth from changing shapes and growing decode context remains possible. A pre-change idle-process snapshot found five 168 MiB pools plus one 6 MiB pool per target GPU, with zero live allocations in those pools; retained peak reservations alone are not proof of a leak.
+
+Evidence: local `investigations/qsa-vram-growth-2026-10-12` and remote `/home/user/qsa-vram-growth-20261012` contain the reproduction scripts, operator traces, output hashes, memory samples, complete server arguments/environment, logs, sanitizer output, build commands and task-only patches. The original remote source and CUDA library hashes remain unchanged. The launcher `/home/user/qsa-scratch-20261012/llama-server` selects the candidate libraries automatically. The model server was left stopped after validation.

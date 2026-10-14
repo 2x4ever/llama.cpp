@@ -137,13 +137,14 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int count_blocks = std::min(nb, k + 1);
     int padded = 1;
     while (padded < std::min(nb, k)) { padded *= 2; }
-    ggml_cuda_pool_alloc<float> dots(ctx.pool(), queries ? size_t(nb)*heads*tile : 1);
     ggml_cuda_pool_alloc<float> masked(ctx.pool(), size_t(nb)*tile);
     ggml_cuda_pool_alloc<int> chosen(ctx.pool(), size_t(count_blocks)*tile);
     ggml_cuda_pool_alloc<int> partial(ctx.pool(), tile);
     for (int start = 0; start < rows;) {
         const int count = std::min(tile, nq - start%nq);
         if (queries) {
+            // Reuse the product scratch for top-k after the stream reduces the scores.
+            ggml_cuda_pool_alloc<float> dots(ctx.pool(), size_t(nb)*heads*tile);
             const int d = queries->ne[0];
             const float alpha = 1.0f, beta = 0.0f;
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
